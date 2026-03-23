@@ -3,11 +3,17 @@
 Autonomous Play → Spring migration orchestrator.
 Single state file: migration-status.json (see play-to-spring-kit skills).
 
-Only --play-repo is required (or PLAY_REPO): the script always runs the kit
-workspace bootstrap first (idempotent: skills, JAR, workspace.yaml, Spring dirs),
-then resolves Spring repo from workspace.yaml or spring-<play-basename>.
+Only --play-repo is required (or PLAY_REPO). By default the script:
 
-Intended usage: cd into the kit clone (play-to-spring-kit) and run
+1. Builds ``java-dev-toolkit`` with Maven (sibling of ``play-to-spring-kit`` in the
+   monorepo, or ``JAVA_DEV_TOOLKIT_ROOT`` / ``--toolkit-root``).
+2. Copies ``dev-toolkit-*.jar`` into ``play-to-spring-kit/lib/``.
+3. Runs ``setup.sh`` (idempotent: skills, JAR into the play repo, workspace.yaml,
+   Spring dirs), then continues migrate / compile / optional cursor-agent.
+
+Use ``--skip-build-toolkit`` if the JAR is already in ``lib/``.
+
+Intended usage: from the monorepo, ``cd play-to-spring-kit`` and run
 ``python3 scripts/migration_orchestrator.py --play-repo ../your-play-app``.
 Kit paths come from ``__file__`` (not cwd); ``--play-repo`` / ``--workspace`` are
 resolved relative to the shell's current working directory.
@@ -23,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +60,116 @@ def scripts_dir() -> Path:
 def kit_root() -> Path:
     """play-to-spring-kit root (``lib/``, ``skills/``, ``config/``, …)."""
     return scripts_dir().parent
+
+
+def default_dev_toolkit_root() -> Path:
+    """``java-dev-toolkit`` next to ``play-to-spring-kit`` (monorepo layout)."""
+    return kit_root().parent / "java-dev-toolkit"
+
+
+def resolved_dev_toolkit_root(cli_path: Path | None) -> Path:
+    if cli_path is not None:
+        return abs_path(cli_path)
+    env = os.environ.get("JAVA_DEV_TOOLKIT_ROOT")
+    if env:
+        return abs_path(Path(env))
+    return default_dev_toolkit_root()
+
+
+def find_packaged_toolkit_jar(toolkit_root: Path) -> Path | None:
+    """Shaded ``dev-toolkit-*.jar`` under ``target/`` (exclude sources/javadoc)."""
+    td = toolkit_root / "target"
+    if not td.is_dir():
+        return None
+    jars = [p for p in td.glob("dev-toolkit-*.jar") if p.is_file()]
+    if not jars:
+        return None
+
+    def sort_key(p: Path) -> tuple[int, str]:
+        n = p.name.lower()
+        if "sources" in n or "javadoc" in n:
+            return (1, p.name)
+        return (0, p.name)
+
+    jars.sort(key=sort_key)
+    return jars[0]
+
+
+def ensure_jar_in_kit_lib(
+    *,
+    skip_build: bool,
+    toolkit_root: Path,
+    dry_run: bool,
+) -> int:
+    """
+    Build ``java-dev-toolkit`` and copy JAR to ``play-to-spring-kit/lib/``,
+    or verify ``lib/`` already contains a JAR when ``skip_build`` is True.
+
+    Returns 0 on success, 1 on failure.
+    """
+    lib_dir = kit_root() / "lib"
+    if skip_build:
+        existing = sorted(lib_dir.glob("*.jar"))
+        if not existing:
+            print(
+                "ERROR: --skip-build-toolkit was set but no JAR was found in "
+                f"{lib_dir}. Build the toolkit and copy dev-toolkit-*.jar there, "
+                "or omit --skip-build-toolkit to build automatically.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"[orchestrator] Using existing JAR in {lib_dir}: {existing[0].name}",
+            flush=True,
+        )
+        return 0
+
+    if not toolkit_root.is_dir():
+        print(
+            f"ERROR: java-dev-toolkit directory not found: {toolkit_root}\n"
+            "  Clone the full repo (sibling layout: java-dev-toolkit + play-to-spring-kit), "
+            "or set JAVA_DEV_TOOLKIT_ROOT / --toolkit-root, or use --skip-build-toolkit "
+            f"if the JAR is already under {lib_dir}/.",
+            file=sys.stderr,
+        )
+        return 1
+    if not (toolkit_root / "pom.xml").is_file():
+        print(
+            f"ERROR: not a Maven project (missing pom.xml): {toolkit_root}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if dry_run:
+        print(
+            f"[dry-run] mvn package -DskipTests in {toolkit_root}; "
+            f"copy dev-toolkit-*.jar -> {lib_dir}/",
+            file=sys.stderr,
+        )
+        return 0
+
+    print(f"[orchestrator] Building dev-toolkit: mvn package -DskipTests in {toolkit_root}", flush=True)
+    p = subprocess.run(
+        ["mvn", "package", "-DskipTests"],
+        cwd=str(toolkit_root),
+    )
+    if p.returncode != 0:
+        print("ERROR: mvn package failed (dev-toolkit build).", file=sys.stderr)
+        return 1
+
+    jar = find_packaged_toolkit_jar(toolkit_root)
+    if jar is None:
+        print(
+            f"ERROR: no dev-toolkit-*.jar under {toolkit_root / 'target'} after build.",
+            file=sys.stderr,
+        )
+        return 1
+
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    dest = lib_dir / jar.name
+    shutil.copy2(jar, dest)
+    print(f"[orchestrator] Installed {jar.name} -> {dest}", flush=True)
+    return 0
 
 
 def parse_workspace_yaml(yaml_path: Path) -> dict[str, str]:
@@ -619,15 +736,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Play → Spring migration orchestrator (migration-status.json only). "
-            "Runs kit workspace bootstrap first; only --play-repo is required."
+            "Builds java-dev-toolkit, copies JAR to lib/, runs setup.sh, then migrates. "
+            "Only --play-repo is required."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Typical run from the kit directory (relative paths use your shell cwd):\n"
+            "Typical run from the monorepo (relative paths use your shell cwd):\n"
             "  cd path/to/play-to-spring-kit\n"
             "  python3 scripts/migration_orchestrator.py --play-repo ../my-play-app\n"
             "\n"
-            "Kit bootstrap and lib/ are resolved from this script's location, not from cwd."
+            "This builds ../java-dev-toolkit unless --skip-build-toolkit. "
+            "Kit paths are resolved from this script's location, not from cwd."
         ),
     )
     pr = os.environ.get("PLAY_REPO")
@@ -678,6 +797,23 @@ def main() -> int:
     parser.add_argument("--no-cursor", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--skip-build-toolkit",
+        action="store_true",
+        help=(
+            "Do not run Maven; require an existing JAR in play-to-spring-kit/lib/. "
+            "Use when you already built java-dev-toolkit."
+        ),
+    )
+    parser.add_argument(
+        "--toolkit-root",
+        type=Path,
+        default=None,
+        help=(
+            "Path to java-dev-toolkit Maven project (default: sibling of play-to-spring-kit "
+            "or JAVA_DEV_TOOLKIT_ROOT)."
+        ),
+    )
     parser.add_argument("--skip-inventory", action="store_true")
     parser.add_argument("--refresh-inventory", action="store_true")
     parser.add_argument("--max-retries-per-layer", type=int, default=5)
@@ -695,6 +831,15 @@ def main() -> int:
 
     play_repo = abs_path(args.play_repo)
     workspace_dir = abs_path(args.workspace) if args.workspace else play_repo.parent
+
+    toolkit_root = resolved_dev_toolkit_root(args.toolkit_root)
+    rc = ensure_jar_in_kit_lib(
+        skip_build=args.skip_build_toolkit,
+        toolkit_root=toolkit_root,
+        dry_run=args.dry_run,
+    )
+    if rc != 0:
+        return 1
 
     rc = run_setup_sh(
         play_repo,
