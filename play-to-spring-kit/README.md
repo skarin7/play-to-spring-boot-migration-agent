@@ -2,23 +2,15 @@
 
 **Independent, reusable** kit to migrate any **Play Framework (Java)** repo to **Spring Boot**.
 
-- **`scripts/migration_orchestrator.py`** is the usual entry point: it **prepares the workspace** for your Play repo (Spring layout, Cursor skills, dev-toolkit JAR copy, **`workspace.yaml`**), then drives **layered `migrate-app` + `mvn compile`**, with optional headless **`cursor-agent`** for compile fixes. Details: **[scripts/README.md](scripts/README.md)**.
+- **`scripts/migration_orchestrator.py`** is the usual entry point: it **builds `java-dev-toolkit`**, copies the JAR into **`lib/`**, runs **`setup.sh`** to **prepare the workspace** (Spring layout, Cursor skills, JAR into the play repo, **`workspace.yaml`**), then drives **layered `migrate-app` + `mvn compile`**, with optional headless **`cursor-agent`** for compile fixes. Details: **[scripts/README.md](scripts/README.md)**.
 - **LLM/agent** initializes the Spring project (`pom.xml`, `Application.java`, `application.properties`) by reading the Play project.
 - **CLI** does ~70% deterministic migration; **LLM/agent** fixes the rest until the build is clean.
 
 ## Quick start
 
-### 1. Build the dev-toolkit JAR (one time)
+### Single command (recommended, full monorepo clone)
 
-```bash
-cd /path/to/java-dev-toolkit
-mvn -q package
-cp target/dev-toolkit-1.0.0.jar /path/to/play-to-spring-kit/lib/
-```
-
-### 2. Run the migration orchestrator (recommended)
-
-From **this kit** directory:
+From **this kit** directory (sibling **`java-dev-toolkit/`** is built automatically):
 
 ```bash
 cd /path/to/play-to-spring-kit
@@ -26,10 +18,24 @@ python3 scripts/migration_orchestrator.py --play-repo /path/to/<play-repo>
 # or relative:  --play-repo ../<play-repo>
 ```
 
+The orchestrator runs **`mvn package -DskipTests`** in **`java-dev-toolkit/`**, copies **`dev-toolkit-*.jar`** into **`play-to-spring-kit/lib/`**, then runs **`setup.sh`** and the migration loop. Details and overrides (**`--skip-build-toolkit`**, **`--toolkit-root`**, **`JAVA_DEV_TOOLKIT_ROOT`**) are in **[scripts/README.md](scripts/README.md)**.
+
 - **Requires:** Python **3.10+**, **`java`** / **`mvn`** on `PATH`; **`cursor-agent`** on `PATH` only if you use API-key mode (see **[scripts/README.md](scripts/README.md)**).
 - **`migration-status.json`** must exist under the Spring repo with **`initialize.status: done`** once the builder has generated the Spring scaffold; otherwise the script exits **3** (same gate as the Cursor orchestrator skill).
 
-### 3. Alternative — manual CLI + Cursor skills (no Python)
+### Manual JAR build (optional)
+
+If you prefer not to use the orchestrator’s automatic build:
+
+```bash
+cd /path/to/java-dev-toolkit
+mvn -q package
+cp target/dev-toolkit-1.0.0.jar /path/to/play-to-spring-kit/lib/
+```
+
+Then run the orchestrator with **`--skip-build-toolkit`**, or use **`setup.sh`** / the JAR directly as below.
+
+### Alternative — manual CLI + Cursor skills (no Python)
 
 If you are **not** using **`migration_orchestrator.py`**, install the kit into the play repo once from the kit directory (the same step the orchestrator performs automatically), then use the JAR and skills:
 
@@ -49,7 +55,7 @@ java -jar dev-toolkit-1.0.0.jar migrate-app
 
 Defaults: source = `.`, target = `../spring-<basename>`.
 
-### 4. Build until clean
+### Build until clean
 
 ```bash
 cd ../spring-<basename> && mvn compile
@@ -63,7 +69,7 @@ Full flags, env vars (`CURSOR_API_KEY`, model overrides, guardrails), exit codes
 
 Summary:
 
-- **Only `--play-repo`** is required (absolute or relative to your shell cwd); **workspace preparation runs on every invocation** (idempotent).
+- **Only `--play-repo`** is required (absolute or relative to your shell cwd); by default the **dev-toolkit Maven build** and **workspace preparation** run on every invocation (idempotent). Use **`--skip-build-toolkit`** when the JAR in **`lib/`** is already up to date.
 - Spring repo and default **`migration-status.json`** come from **`workspace.yaml`** or **`spring-<play-basename>`**.
 - Prefer **`cd play-to-spring-kit`** then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`** so relative play paths match your tree; kit paths are resolved from the script location, not cwd.
 
@@ -100,7 +106,7 @@ All commands are in the skills; the agent runs CLI directly.
 
 ```
 play-to-spring-kit/                   # This kit (clone)
-├── lib/                              # Place dev-toolkit-1.0.0.jar here
+├── lib/                              # dev-toolkit-*.jar (orchestrator build or manual copy)
 ├── scripts/
 │   ├── setup.sh                      # Manual kit install (optional; orchestrator runs it automatically)
 │   ├── migration_orchestrator.py    # Recommended: bootstrap + layered migrate + compile
@@ -135,8 +141,15 @@ After workspace preparation, skills live under `<play-repo>/.cursor/skills/` so 
 
 ## Using the kit on another repo
 
-1. Copy the **play-to-spring-kit** folder (or clone it).
-2. Put `dev-toolkit-1.0.0.jar` in `play-to-spring-kit/lib/`.
-3. **Recommended:** `cd play-to-spring-kit && python3 scripts/migration_orchestrator.py --play-repo <path-to-play-repo>` — see **[scripts/README.md](scripts/README.md)**.
-4. **Or** manual install + JAR: from the kit directory `./scripts/setup.sh <path-to-play-repo>`, then from the Play repo `java -jar dev-toolkit-1.0.0.jar migrate-app`, then `cd ../spring-<basename> && mvn compile`.
-5. Use Cursor skills as needed for init / fixes.
+**Full repository (recommended):** clone this repo so **`java-dev-toolkit/`** sits next to **`play-to-spring-kit/`**, then:
+
+```bash
+cd play-to-spring-kit
+python3 scripts/migration_orchestrator.py --play-repo <path-to-play-repo>
+```
+
+See **[scripts/README.md](scripts/README.md)** for **`--toolkit-root`** / **`JAVA_DEV_TOOLKIT_ROOT`** if your layout differs.
+
+**Kit folder only:** copy **`play-to-spring-kit/`** and put **`dev-toolkit-*.jar`** in **`lib/`**, then either run the orchestrator with **`--skip-build-toolkit`** or use **`./scripts/setup.sh`** and the JAR manually as in the alternative flow above.
+
+Use Cursor skills as needed for init / fixes.

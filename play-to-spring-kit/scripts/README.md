@@ -4,15 +4,21 @@ Python **stdlib-only** driver for the Play → Spring pipeline: `dev-toolkit` **
 
 **State:** a single **`migration-status.json`** (no `pipeline_state.json`). Default path is **`<spring-repo>/migration-status.json`**, where **`spring-repo`** is resolved after **workspace preparation** (see below). Override with `--status-file` or `MIGRATION_STATUS_FILE`.
 
-**First step (automatic):** each run **prepares the workspace** for **`--play-repo`**: Spring project directories, **`workspace.yaml`**, Cursor skills and kit files under **`<play-repo>/.cursor/`**, and copies **`dev-toolkit-1.0.0.jar`** from **`lib/`** into the play repo. This step is **idempotent**.
+**First steps (automatic):** each run, unless you pass **`--skip-build-toolkit`**:
 
-**Where to run from:** use the kit clone as your shell cwd, e.g. **`cd …/play-to-spring-kit`**, then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`**. The kit root (bootstrap script, **`lib/`**) is found via the script file path (**`__file__`**), not cwd. Relative **`--play-repo`** / **`--workspace`** values are resolved against **cwd**, so paths like **`../cms-content-service`** are correct when you launch from the kit directory.
+1. Runs **`mvn package -DskipTests`** in **`java-dev-toolkit/`** (default: directory **next to** **`play-to-spring-kit/`** in the monorepo; override with **`JAVA_DEV_TOOLKIT_ROOT`** or **`--toolkit-root`**).
+2. Copies the shaded **`dev-toolkit-*.jar`** into **`play-to-spring-kit/lib/`**.
+3. Runs **`setup.sh`**, which **prepares the workspace** for **`--play-repo`**: Spring project directories, **`workspace.yaml`**, Cursor skills and kit files under **`<play-repo>/.cursor/`**, and copies the JAR from **`lib/`** into the play repo. This step is **idempotent**.
+
+With **`--skip-build-toolkit`**, you must already have a **`*.jar`** in **`play-to-spring-kit/lib/`** (for example after a manual **`mvn package`**). Use that flag on **re-runs** when you have **not** changed **`java-dev-toolkit`**—the default is to **`mvn package`** every orchestrator invocation so a single command always stays self-contained.
+
+**Where to run from:** use the kit directory as your shell cwd, e.g. **`cd …/play-to-spring-kit`**, then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`**. The kit root (bootstrap script, **`lib/`**) is found via the script file path (**`__file__`**), not cwd. Relative **`--play-repo`** / **`--workspace`** values are resolved against **cwd**, so paths like **`../cms-content-service`** are correct when you launch from the kit directory.
 
 ## Requirements
 
 - Python **3.10+**
-- **`java`**, **`mvn`** on `PATH`
-- **`dev-toolkit-1.0.0.jar`** in **`play-to-spring-kit/lib/`** (copied to `<play-repo>/` during workspace prep, or pass `--jar`)
+- **`java`**, **`mvn`** on **`PATH`** (Maven required for the default **build-toolkit** step; omit if you use **`--skip-build-toolkit`** and keep a JAR in **`lib/`**)
+- **`dev-toolkit-*.jar`** ends up in **`play-to-spring-kit/lib/`** via the automatic build, or place it there yourself when using **`--skip-build-toolkit`**
 - **`cursor-agent`** on `PATH` if using LLM fixes (see Cursor docs for install)
 
 ## Cursor / model
@@ -43,6 +49,7 @@ Optional: `CURSOR_AGENT_TIMEOUT_SEC` (default **1800**) per agent invocation.
 
 | Variable | Purpose |
 |----------|---------|
+| `JAVA_DEV_TOOLKIT_ROOT` | Path to the **`java-dev-toolkit`** Maven project when not using the default sibling of **`play-to-spring-kit/`** |
 | `PLAY_REPO` | Default `--play-repo` (Play project root) |
 | `SPRING_REPO` | Optional explicit Spring root (skips `workspace.yaml` / `spring-<basename>` resolution) |
 | `MIGRATION_STATUS_FILE` | Explicit status file path if set (only when `--status-file` is omitted) |
@@ -109,6 +116,8 @@ Common flags:
 - `--no-cursor` — compile only; exit **2** if errors repeat (stuck detection) without improvement
 - `--fail-fast` — exit on first layer `loop_detected` / `max_retries` / `timeout`
 - `--dry-run` — print actions, no subprocess side effects (limited)
+- `--skip-build-toolkit` — skip **`mvn package`**; require a **`*.jar`** in **`play-to-spring-kit/lib/`**
+- `--toolkit-root DIR` — **`java-dev-toolkit`** Maven project path (default: sibling of the kit; see **`JAVA_DEV_TOOLKIT_ROOT`**)
 - `--skip-inventory` — do not scan Play `app/` for `source_inventory`
 - `--refresh-inventory` — recompute `source_inventory` even if present
 
