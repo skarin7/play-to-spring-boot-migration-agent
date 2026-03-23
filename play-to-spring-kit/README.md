@@ -10,7 +10,7 @@
 
 ### Single command (recommended, full monorepo clone)
 
-From **this kit** directory (sibling **`java-dev-toolkit/`** is built automatically):
+From the **monorepo root** you can use **`./start_upgrade.sh --play-repo …`** (see root **[README.md](../README.md)**). From **this kit** directory (sibling **`java-dev-toolkit/`** is built automatically):
 
 ```bash
 cd /path/to/play-to-spring-kit

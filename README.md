@@ -4,6 +4,27 @@ This project helps you **upgrade any Play Framework application written in Java*
 
 A **Java CLI JAR** performs bulk AST-style transforms (`migrate-app`, single-file `transform`, and related commands). **Cursor** drives initialization of the Spring project, layered migration, and iterating until `mvn compile` is clean. How that fits together, end-to-end options, and requirements are documented under each component below—start there rather than duplicating detail here.
 
+## What triggers the automation
+
+Automation is **not** implicit (nothing runs on clone or on folder open). You start it explicitly by running the **migration orchestrator**, which builds **`java-dev-toolkit`**, refreshes **`play-to-spring-kit/lib/`**, runs **`setup.sh`**, then performs layered **`migrate-app`** and **`mvn compile`** (and optional **`cursor-agent`** fixes) as described in **[play-to-spring-kit/scripts/README.md](play-to-spring-kit/scripts/README.md)**.
+
+**Recommended (full repo clone):** from the **repository root**, run:
+
+```bash
+chmod +x start_upgrade.sh   # once per clone
+./start_upgrade.sh --play-repo /path/to/your-play-app
+```
+
+[`start_upgrade.sh`](start_upgrade.sh) is a thin wrapper around [`play-to-spring-kit/scripts/migration_orchestrator.py`](play-to-spring-kit/scripts/migration_orchestrator.py); all orchestrator flags (e.g. **`--help`**, **`--skip-build-toolkit`**, **`--workspace`**) are passed through unchanged.
+
+**Equivalent:** from **`play-to-spring-kit/`**:
+
+```bash
+python3 scripts/migration_orchestrator.py --play-repo /path/to/your-play-app
+```
+
+You do **not** need to `cd` into **`scripts/`**; run the wrapper from the repo root or invoke the Python file with a path as above. **`migration-status.json`** must already have **`initialize.status: done`** in the Spring project before the transform/compile loop runs; until then the orchestrator exits with code **3** (see the kit scripts README).
+
 ## What lives where
 
 | Directory | Role | Details |
