@@ -1,0 +1,33 @@
+===CONTEXT===
+Below is the relevant context for the {{current_class}} class and its dependencies. Please use this context to generate a comprehensive JUnit test for the specified method(s).
+
+---IMPORTS---
+{{import_statements}}
+
+---DEPENDENCIES---
+{{current_method_dependencies}}
+
+---CONSTRUCTOR---
+{{constructor}}
+
+---CLASS JAVADOC---
+{{class_javadoc}}
+===END_CONTEXT===
+
+===PROMPT===
+Refer to the context above for imports, dependencies, and constructor.
+
+---METHODS---
+{{methods_code}}
+
+---INSTRUCTIONS---
+Generate a comprehensive JUnit test for the following method(s) in {{current_class}}: {{methodNames}}. The test should:
+1. Include proper mocking of all dependencies using Mockito
+2. Test both success and failure scenarios
+3. Include edge cases and boundary conditions
+4. Have high code coverage
+5. Follow best practices for test organization and readability
+8. Test any complex business logic thoroughly
+
+The test should be written in a way that it can be easily maintained and understood by other developers.
+===END_PROMPT=== 
