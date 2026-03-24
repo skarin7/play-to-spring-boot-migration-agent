@@ -77,7 +77,7 @@ If both `migrate-app` and `transform` fail for a specific file, manually migrate
 1. Read the Play source file.
 2. Apply Play→Spring mapping:
    - `@Singleton` → `@Component` (or `@Service`/`@RestController` based on layer)
-   - `@Inject` → constructor injection
+   - `@Inject` → `@Autowired` (dev-toolkit maps optional fields/methods to `@Autowired(required=false)`; optional **constructor** parameters to `Optional<T>` — not `@Autowired(required=false)` on ctor parameters)
    - `play.mvc.Result` → `ResponseEntity`
    - `play.mvc.Controller` → `@RestController`
    - `play.Logger` → SLF4J `LoggerFactory`

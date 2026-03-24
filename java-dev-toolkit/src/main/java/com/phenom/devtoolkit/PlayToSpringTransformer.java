@@ -13,12 +13,16 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.BooleanLiteralExpr;
 import com.github.javaparser.ast.expr.ClassExpr;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.MarkerAnnotationExpr;
+import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.ast.ImportDeclaration;
@@ -224,26 +228,26 @@ public class PlayToSpringTransformer {
         boolean changed = false;
         for (ClassOrInterfaceDeclaration type : cu.findAll(ClassOrInterfaceDeclaration.class)) {
             for (FieldDeclaration fd : type.getFields()) {
-                if (replaceInjectOnAnnotations(fd.getAnnotations())) {
+                if (replaceInjectOnFieldOrMethodAnnotations(fd.getAnnotations(), cu, result)) {
                     changed = true;
                 }
             }
             for (MethodDeclaration md : type.getMethods()) {
-                if (replaceInjectOnAnnotations(md.getAnnotations())) {
+                if (replaceInjectOnFieldOrMethodAnnotations(md.getAnnotations(), cu, result)) {
                     changed = true;
                 }
                 for (Parameter p : md.getParameters()) {
-                    if (replaceInjectOnAnnotations(p.getAnnotations())) {
+                    if (replaceInjectOnCallableParameter(p, cu, result, false, md)) {
                         changed = true;
                     }
                 }
             }
             for (ConstructorDeclaration cd : type.getConstructors()) {
-                if (replaceInjectOnAnnotations(cd.getAnnotations())) {
+                if (replaceInjectOnConstructorDeclarationAnnotations(cd.getAnnotations(), cu, result)) {
                     changed = true;
                 }
                 for (Parameter p : cd.getParameters()) {
-                    if (replaceInjectOnAnnotations(p.getAnnotations())) {
+                    if (replaceInjectOnCallableParameter(p, cu, result, true, cd)) {
                         changed = true;
                     }
                 }
@@ -251,23 +255,156 @@ public class PlayToSpringTransformer {
         }
         if (changed) {
             ensureImport(cu, "org.springframework.beans.factory.annotation.Autowired");
-            result.appliedChanges.add("Replaced @Inject with @Autowired (fields/constructors/methods)");
+            result.appliedChanges.add(
+                    "Replaced @Inject with @Autowired / java.util.Optional (Spring: optional ctor params use Optional<T>)");
         }
     }
 
-    private boolean replaceInjectOnAnnotations(NodeList<AnnotationExpr> annotations) {
+    /**
+     * Fields and setter/injection methods: {@code @Inject(optional=true)} → {@code @Autowired(required=false)}.
+     * Marker {@code @Inject} → {@code @Autowired}.
+     */
+    private boolean replaceInjectOnFieldOrMethodAnnotations(
+            NodeList<AnnotationExpr> annotations, CompilationUnit cu, TransformResult result) {
         List<AnnotationExpr> copy = new ArrayList<>(annotations);
         boolean replaced = false;
         annotations.clear();
         for (AnnotationExpr ann : copy) {
-            if (isInjectAnnotation(ann)) {
-                annotations.add(new MarkerAnnotationExpr("Autowired"));
-                replaced = true;
-            } else {
+            if (!isInjectAnnotation(ann)) {
                 annotations.add(ann);
+                continue;
+            }
+            replaced = true;
+            if (injectIsOptional(ann)) {
+                annotations.add(autowiredRequiredFalseAnnotation());
+                result.appliedChanges.add("@Inject(optional=true) → @Autowired(required=false)");
+            } else {
+                annotations.add(new MarkerAnnotationExpr("Autowired"));
             }
         }
         return replaced;
+    }
+
+    /**
+     * Constructor-level {@code @Inject}. Guice forbids {@code optional} on constructors; if present, still map to
+     * {@code @Autowired} and warn — prefer {@code Optional<T>} on individual parameters instead.
+     */
+    private boolean replaceInjectOnConstructorDeclarationAnnotations(
+            NodeList<AnnotationExpr> annotations, CompilationUnit cu, TransformResult result) {
+        List<AnnotationExpr> copy = new ArrayList<>(annotations);
+        boolean replaced = false;
+        annotations.clear();
+        for (AnnotationExpr ann : copy) {
+            if (!isInjectAnnotation(ann)) {
+                annotations.add(ann);
+                continue;
+            }
+            replaced = true;
+            if (injectIsOptional(ann)) {
+                result.warnings.add(
+                        "Constructor had @Inject(optional=true) (invalid in Guice); mapped to @Autowired — use @Inject(optional=true) on parameters + Optional<T> instead");
+            }
+            annotations.add(new MarkerAnnotationExpr("Autowired"));
+        }
+        return replaced;
+    }
+
+    /**
+     * Constructor/method parameter: optional {@code @Inject} → {@code Optional<Type>} and no param annotation;
+     * required {@code @Inject} → {@code @Autowired} on parameter.
+     */
+    private boolean replaceInjectOnCallableParameter(
+            Parameter p,
+            CompilationUnit cu,
+            TransformResult result,
+            boolean isConstructor,
+            Object parentCallable) {
+        List<AnnotationExpr> copy = new ArrayList<>(p.getAnnotations());
+        boolean changed = false;
+        p.getAnnotations().clear();
+        for (AnnotationExpr ann : copy) {
+            if (!isInjectAnnotation(ann)) {
+                p.getAnnotations().add(ann);
+                continue;
+            }
+            changed = true;
+            if (injectIsOptional(ann)) {
+                wrapParameterTypeInOptional(p, cu);
+                if (isConstructor && parentCallable instanceof ConstructorDeclaration) {
+                    ensureAutowiredOnConstructor((ConstructorDeclaration) parentCallable, cu);
+                } else if (!isConstructor && parentCallable instanceof MethodDeclaration) {
+                    ensureAutowiredOnMethod((MethodDeclaration) parentCallable, cu);
+                }
+                result.appliedChanges.add(
+                        "Optional constructor/method param: @Inject(optional=true) → Optional<…> (update body to use Optional API if needed)");
+            } else {
+                p.addAnnotation(new MarkerAnnotationExpr("Autowired"));
+            }
+        }
+        return changed;
+    }
+
+    private static NormalAnnotationExpr autowiredRequiredFalseAnnotation() {
+        return new NormalAnnotationExpr(
+                new Name("Autowired"),
+                new NodeList<>(new MemberValuePair("required", new BooleanLiteralExpr(false))));
+    }
+
+    private static boolean injectIsOptional(AnnotationExpr ann) {
+        if (!(ann instanceof NormalAnnotationExpr)) {
+            return false;
+        }
+        NormalAnnotationExpr n = (NormalAnnotationExpr) ann;
+        for (MemberValuePair pair : n.getPairs()) {
+            if ("optional".equals(pair.getNameAsString()) && pair.getValue().isBooleanLiteralExpr()) {
+                return pair.getValue().asBooleanLiteralExpr().getValue();
+            }
+        }
+        return false;
+    }
+
+    private void wrapParameterTypeInOptional(Parameter p, CompilationUnit cu) {
+        Type t = p.getType();
+        if (isJavaUtilOptionalType(t)) {
+            ensureImport(cu, "java.util.Optional");
+            return;
+        }
+        Type inner = t.clone();
+        ClassOrInterfaceType wrapped = new ClassOrInterfaceType(null, "Optional");
+        wrapped.setTypeArguments(new NodeList<>(inner));
+        p.setType(wrapped);
+        ensureImport(cu, "java.util.Optional");
+    }
+
+    private static boolean isJavaUtilOptionalType(Type t) {
+        if (!(t instanceof ClassOrInterfaceType)) {
+            return false;
+        }
+        ClassOrInterfaceType c = (ClassOrInterfaceType) t;
+        return "Optional".equals(c.getNameAsString()) && c.getTypeArguments().isPresent();
+    }
+
+    private void ensureAutowiredOnConstructor(ConstructorDeclaration cd, CompilationUnit cu) {
+        if (!hasAutowiredMeta(cd.getAnnotations())) {
+            cd.addAnnotation(new MarkerAnnotationExpr("Autowired"));
+            ensureImport(cu, "org.springframework.beans.factory.annotation.Autowired");
+        }
+    }
+
+    private void ensureAutowiredOnMethod(MethodDeclaration md, CompilationUnit cu) {
+        if (!hasAutowiredMeta(md.getAnnotations())) {
+            md.addAnnotation(new MarkerAnnotationExpr("Autowired"));
+            ensureImport(cu, "org.springframework.beans.factory.annotation.Autowired");
+        }
+    }
+
+    private static boolean hasAutowiredMeta(NodeList<AnnotationExpr> anns) {
+        return anns.stream().anyMatch(PlayToSpringTransformer::isAutowiredNamedAnnotation);
+    }
+
+    private static boolean isAutowiredNamedAnnotation(AnnotationExpr a) {
+        String n = a.getNameAsString();
+        return "Autowired".equals(n) || n.endsWith(".Autowired");
     }
 
     private boolean isInjectAnnotation(AnnotationExpr ann) {

@@ -393,6 +393,49 @@ public class PlayToSpringTransformerTest {
     }
 
     @Test
+    public void transform_guiceOptionalInjectField_becomesAutowiredRequiredFalse() throws Exception {
+        String src = "import com.google.inject.Inject;\n\npublic class OptField {\n"
+                + "    @Inject(optional = true)\n    Foo dep;\n}\n";
+        Path input = tempDir.resolve("OptField.java");
+        Path output = tempDir.resolve("out/OptField.java");
+        Files.write(input, src.getBytes());
+        transformer.transform(input, output, LayerDetector.Layer.OTHER);
+        String out = new String(Files.readAllBytes(output));
+        assertTrue(out.contains("required = false") || out.contains("required=false"));
+        assertTrue(out.contains("@Autowired"));
+        assertFalse(out.contains("@Inject"));
+    }
+
+    @Test
+    public void transform_guiceOptionalInjectConstructorParam_becomesOptionalType() throws Exception {
+        String src = "import com.google.inject.Inject;\n\npublic class OptCtor {\n"
+                + "    @Inject\n    OptCtor(@Inject(optional = true) Foo a) {}\n}\n";
+        Path input = tempDir.resolve("OptCtor.java");
+        Path output = tempDir.resolve("out/OptCtor.java");
+        Files.write(input, src.getBytes());
+        transformer.transform(input, output, LayerDetector.Layer.OTHER);
+        String out = new String(Files.readAllBytes(output));
+        assertTrue(out.contains("Optional<Foo>"));
+        assertTrue(out.contains("@Autowired"));
+    }
+
+    @Test
+    public void transform_springStyleAutowiredRequiredFalseOnCtorParam_rewrittenToOptional() throws Exception {
+        String src = "import org.springframework.beans.factory.annotation.Autowired;\n\n"
+                + "public class BadSpring {\n"
+                + "    @Autowired\n"
+                + "    public BadSpring(@Autowired(required = false) Foo a) {}\n}\n";
+        Path input = tempDir.resolve("BadSpring.java");
+        Path output = tempDir.resolve("out/BadSpring.java");
+        Files.write(input, src.getBytes());
+        transformer.transform(input, output, LayerDetector.Layer.OTHER);
+        String out = new String(Files.readAllBytes(output));
+        assertTrue(out.contains("Optional<Foo>"));
+        assertFalse(out.contains("required = false"));
+        assertFalse(out.contains("required=false"));
+    }
+
+    @Test
     public void writeReport_writesJsonFile() throws Exception {
         PlayToSpringTransformer.TransformResult result = new PlayToSpringTransformer.TransformResult();
         result.input = "a.java";
