@@ -255,7 +255,7 @@ public class PlayToSpringTransformerTest {
         assertTrue(out.contains("org.springframework.web.client.RestTemplate"));
         assertTrue(out.contains("@PreDestroy"));
         assertTrue(out.contains("playApplicationShutdown"));
-        assertTrue(out.contains("objectMapper.readTree"));
+        assertTrue(out.contains("JacksonJson.readTree"));
         assertTrue(out.contains("postForEntity"));
         assertTrue(out.contains("getStatusCode().value()"));
         assertFalse(out.contains("WSClient"));

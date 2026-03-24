@@ -15,13 +15,15 @@ chmod +x start_upgrade.sh   # once per clone
 ./start_upgrade.sh --play-repo /path/to/your-play-app
 ```
 
-[`start_upgrade.sh`](start_upgrade.sh) is a thin wrapper around [`play-to-spring-kit/scripts/migration_orchestrator.py`](play-to-spring-kit/scripts/migration_orchestrator.py); all orchestrator flags (e.g. **`--help`**, **`--skip-build-toolkit`**, **`--workspace`**) are passed through unchanged.
+[`start_upgrade.sh`](start_upgrade.sh) runs the orchestrator with a **dedicated venv** at **`play-to-spring-kit/.venv`**: it creates that directory on first use, then **`pip install -r play-to-spring-kit/scripts/requirements-venv.txt`** (includes optional **`pyhocon`** for **`--export-play-conf`**). No system **`--break-system-packages`** is required. Set **`MIGRATION_SKIP_VENV_SYNC=1`** to skip the pip step (reuse an already-provisioned `.venv`). All orchestrator flags (e.g. **`--help`**, **`--skip-build-toolkit`**, **`--workspace`**) pass through unchanged.
 
-**Equivalent:** from **`play-to-spring-kit/`**:
+**Equivalent (system Python):** from **`play-to-spring-kit/`**:
 
 ```bash
 python3 scripts/migration_orchestrator.py --play-repo /path/to/your-play-app
 ```
+
+For **`--export-play-conf`** without **`start_upgrade.sh`**, use a venv or install **`pyhocon`** yourself (see kit **[scripts/README.md](play-to-spring-kit/scripts/README.md)**).
 
 You do **not** need to `cd` into **`scripts/`**; run the wrapper from the repo root or invoke the Python file with a path as above. **`migration-status.json`** must already have **`initialize.status: done`** in the Spring project before the transform/compile loop runs; until then the orchestrator exits with code **3** (see the kit scripts README).
 

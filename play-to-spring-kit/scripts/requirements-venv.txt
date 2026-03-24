@@ -1,0 +1,2 @@
+# Installed into play-to-spring-kit/.venv by ../../start_upgrade.sh (stdlib orchestrator + optional tools).
+-r requirements-conf.txt

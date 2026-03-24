@@ -75,7 +75,8 @@ Setup creates the directory structure but **no `pom.xml` or source files**. You 
    - `play.server.http.port` → `server.port`
    - etc.
 
-4. **Generate `Application.java`** at `src/main/java/<base-package-path>/Application.java`:
+4. **Generate `Application.java`** at `src/main/java/<base-package-path>/Application.java`. **`<base_package>` must be the application root** (e.g. `com.acme.myapp`), **not** a leaf folder like `…utils` or `…controllers`. `@SpringBootApplication` only component-scans that package and its children; if `Application` sits under `utils`, `@Component` classes in `db`/`service` are not registered and autowiring fails. If you cannot move the class, add `@SpringBootApplication(scanBasePackages = "<root>")` for the full migrated package tree. **`setup.sh`** writes a normalized `base_package` (trailing segments like `utils`, `service`, `db` are stripped from the first detected Play package).
+
    ```java
    package <base_package>;
 

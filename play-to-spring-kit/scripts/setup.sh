@@ -70,16 +70,41 @@ echo "Play repo:     $PLAY_REPO"
 echo "Workspace:     $WORKSPACE_DIR"
 echo "Spring project: $SPRING_REPO"
 
-# Detect base Java package from Play app (first .java file)
+# Strip trailing path segments that are not the app root (utils, controllers, service, …).
+# Spring Boot scans only the @SpringBootApplication package and below — if workspace.yaml used
+# com.acme.app.utils as base_package, Application.java would live under utils/ and beans in db/
+# would never be discovered.
+normalize_base_package() {
+  local pkg="$1"
+  local trim="|utils|controllers|services|service|models|model|db|repository|repositories|dao|assets|events|filters|modules|module|config|core|"
+  IFS='.' read -r -a parts <<< "$pkg"
+  while [[ ${#parts[@]} -gt 2 ]]; do
+    local n=${#parts[@]}
+    local last="${parts[$((n - 1))]}"
+    if [[ "$trim" == *"|$last|"* ]]; then
+      parts=("${parts[@]:0:n-1}")
+    else
+      break
+    fi
+  done
+  local out="" i
+  for ((i = 0; i < ${#parts[@]}; i++)); do
+    [[ -n "$out" ]] && out+="."
+    out+="${parts[$i]}"
+  done
+  echo "$out"
+}
+
+# Detect base Java package from Play app (first few .java files); normalize away leaf folders.
 detect_base_package() {
   local app_dir="$1"
   local f
-  for f in $(find "$app_dir" -name "*.java" 2>/dev/null | head -5); do
+  for f in $(find "$app_dir" -name "*.java" 2>/dev/null | head -20); do
     if [[ -f "$f" ]]; then
-      local pkg=$(grep -m1 '^package ' "$f" 2>/dev/null | sed 's/package \([^;]*\);/\1/' | tr -d ' ')
+      local pkg
+      pkg=$(grep -m1 '^package ' "$f" 2>/dev/null | sed 's/package \([^;]*\);/\1/' | tr -d ' ')
       if [[ -n "$pkg" ]]; then
-        # Use top-level package (first two segments) or full base for Application
-        echo "$pkg"
+        echo "$(normalize_base_package "$pkg")"
         return
       fi
     fi
