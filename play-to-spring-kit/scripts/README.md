@@ -104,7 +104,11 @@ MIGRATION_VERBOSE=1 python3 scripts/migration_orchestrator.py --play-repo ../my-
 | `MIGRATION_STATUS_FILE` | Explicit status file path if set (only when `--status-file` is omitted) |
 | `CURSOR_API_KEY` | Required for `cursor-agent` (omit with `--no-cursor`) |
 | `MIGRATION_VERBOSE` | Set to `1` / `true` / `yes` for DEBUG logging (same idea as `-v`) |
-| `CURSOR_MODEL` / `MIGRATION_CURSOR_MODEL` | Model slug |
+| `CURSOR_MODEL` / `MIGRATION_CURSOR_MODEL` | Main cursor-agent model (default `composer-2`); used for init and for **all** compile-fix rounds unless optimisation is on |
+| `MIGRATION_OPTIMISE_COMPILE_FIX` | Set to `1` / `true` / `yes` for two-tier compile-fix: cheap model first (`cursor-small`), then main model (same as CLI `--optimise-compile-fix` / `-O`) |
+| `CURSOR_MODEL_FIX` / `MIGRATION_CURSOR_MODEL_FIX` | Override the first-pass compile-fix model (optional; default without optimisation is **same as** `CURSOR_MODEL`) |
+| `CURSOR_MODEL_ESCALATE` / `MIGRATION_CURSOR_MODEL_ESCALATE` | Model after `ESCALATE_AFTER_RETRIES` failed fix rounds when optimisation is on (default: same as `CURSOR_MODEL`) |
+| `ESCALATE_AFTER_RETRIES` | Switch to escalate model after this many unsuccessful fix rounds (default 2; only matters when optimisation is on) |
 | `MAX_RETRIES_PER_LAYER` | Default 5 |
 | `MAX_TOTAL_LLM_CALLS` | Default 50 (whole run) |
 | `MAX_ERRORS_TO_SEND_LLM` | Default 10 (per prompt) |

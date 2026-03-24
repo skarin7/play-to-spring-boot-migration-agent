@@ -1,9 +1,11 @@
 package com.phenom.devtoolkit;
 
+import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.expr.AnnotationExpr;
@@ -31,6 +33,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * Post-transform fixes that address common Spring 6 / Jackson / Neo4j compile failures after Play migration.
@@ -86,6 +89,18 @@ final class SpringCompileFixups {
         if (rewriteAutowiredRequiredFalseConstructorParamsToOptional(cu, clazz, result)) {
             ensureImport(cu, "java.util.Optional");
             ensureImport(cu, "org.springframework.beans.factory.annotation.Autowired");
+        }
+        if (rewriteJavaxInjectImportsToJakarta(cu, result)) {
+            // imports only
+        }
+        if (rewriteJavaxAnnotationImportsToJakarta(cu, result)) {
+            // imports only
+        }
+        if (rewriteNeo4jDriverV1ImportsAndTypes(cu, result)) {
+            // ensureImport may run inside rewrite when needed
+        }
+        if (rewritePlayMvcHttpRequestToServlet(cu, result)) {
+            // ensureImport runs inside rewrite
         }
     }
 
@@ -354,6 +369,191 @@ final class SpringCompileFixups {
         }
         if (any) {
             result.appliedChanges.add("ResponseEntity.ok(\"…\") → ok(objectMapper.valueToTree(\"…\")) for JsonNode return");
+        }
+        return any;
+    }
+
+    private static boolean rewriteJavaxInjectImportsToJakarta(
+            CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        boolean any = false;
+        for (ImportDeclaration imp : new ArrayList<>(cu.getImports())) {
+            if (imp.isAsterisk()) {
+                continue;
+            }
+            String n = imp.getNameAsString();
+            if (n.startsWith("javax.inject.")) {
+                cu.getImports().remove(imp);
+                ensureImport(cu, n.replace("javax.inject.", "jakarta.inject."));
+                any = true;
+            }
+        }
+        if (any) {
+            result.appliedChanges.add("javax.inject.* imports -> jakarta.inject.*");
+        }
+        return any;
+    }
+
+    private static boolean rewriteJavaxAnnotationImportsToJakarta(
+            CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        boolean any = false;
+        for (ImportDeclaration imp : new ArrayList<>(cu.getImports())) {
+            if (imp.isAsterisk()) {
+                continue;
+            }
+            String n = imp.getNameAsString();
+            if (n.startsWith("javax.annotation.")) {
+                cu.getImports().remove(imp);
+                ensureImport(cu, n.replace("javax.annotation.", "jakarta.annotation."));
+                any = true;
+            }
+        }
+        if (any) {
+            result.appliedChanges.add("javax.annotation.* imports -> jakarta.annotation.*");
+        }
+        return any;
+    }
+
+    private static boolean rewriteNeo4jDriverV1ImportsAndTypes(
+            CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        final String v1 = "org.neo4j.driver.v1";
+        final String v5 = "org.neo4j.driver";
+        boolean any = false;
+        for (ImportDeclaration imp : new ArrayList<>(cu.getImports())) {
+            if (imp.isAsterisk()) {
+                continue;
+            }
+            String n = imp.getNameAsString();
+            if (n.startsWith(v1)) {
+                cu.getImports().remove(imp);
+                String rep = n.replace(v1, v5);
+                ensureImport(cu, rep);
+                any = true;
+            }
+        }
+        boolean boltRenamed = false;
+        for (com.github.javaparser.ast.expr.NameExpr ne : new ArrayList<>(cu.findAll(
+                com.github.javaparser.ast.expr.NameExpr.class))) {
+            if ("BoltServerAddress".equals(ne.getNameAsString())) {
+                ne.replace(new com.github.javaparser.ast.expr.NameExpr("ServerAddress"));
+                boltRenamed = true;
+                any = true;
+            }
+        }
+        if (boltRenamed) {
+            ensureImport(cu, "org.neo4j.driver.net.ServerAddress");
+        }
+        any |= replaceTypesContainingPrefix(cu, v1, v5);
+        if (any) {
+            result.appliedChanges.add("Neo4j driver v1 imports/types -> org.neo4j.driver.*");
+        }
+        return any;
+    }
+
+    private static boolean replaceTypesContainingPrefix(CompilationUnit cu, String fromPkg, String toPkg) {
+        boolean any = false;
+        for (Parameter p : new ArrayList<>(cu.findAll(Parameter.class))) {
+            if (retypeIfContains(p.getType(), fromPkg, toPkg, p::setType)) {
+                any = true;
+            }
+        }
+        for (ConstructorDeclaration cd : new ArrayList<>(cu.findAll(ConstructorDeclaration.class))) {
+            for (Parameter p : cd.getParameters()) {
+                if (retypeIfContains(p.getType(), fromPkg, toPkg, p::setType)) {
+                    any = true;
+                }
+            }
+        }
+        for (MethodDeclaration md : new ArrayList<>(cu.findAll(MethodDeclaration.class))) {
+            for (Parameter p : md.getParameters()) {
+                if (retypeIfContains(p.getType(), fromPkg, toPkg, p::setType)) {
+                    any = true;
+                }
+            }
+            Type rt = md.getType();
+            if (rt != null && !rt.isVoidType()) {
+                if (retypeIfContains(rt, fromPkg, toPkg, md::setType)) {
+                    any = true;
+                }
+            }
+        }
+        for (FieldDeclaration fd : new ArrayList<>(cu.findAll(FieldDeclaration.class))) {
+            // JavaParser 3.25+: use setAllTypes (setElementType removed from NodeWithVariables).
+            if (retypeIfContains(fd.getElementType(), fromPkg, toPkg, t -> fd.setAllTypes(t))) {
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    private static boolean retypeIfContains(
+            Type type,
+            String fromPkg,
+            String toPkg,
+            Consumer<Type> applyParsed) {
+        if (type == null) {
+            return false;
+        }
+        String ts = type.asString();
+        if (!ts.contains(fromPkg)) {
+            return false;
+        }
+        try {
+            Type parsed = StaticJavaParser.parseType(ts.replace(fromPkg, toPkg));
+            applyParsed.accept(parsed);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean rewritePlayMvcHttpRequestToServlet(
+            CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        final String playReq = "play.mvc.Http.Request";
+        boolean any = false;
+        for (ImportDeclaration imp : new ArrayList<>(cu.getImports())) {
+            String n = imp.getNameAsString();
+            if (n.equals("play.mvc.Http") || n.startsWith("play.mvc.Http.")) {
+                cu.getImports().remove(imp);
+                any = true;
+            }
+        }
+        for (Parameter p : new ArrayList<>(cu.findAll(Parameter.class))) {
+            if (playReq.equals(p.getType().asString())) {
+                p.setType(StaticJavaParser.parseType("jakarta.servlet.http.HttpServletRequest"));
+                any = true;
+            }
+        }
+        for (ConstructorDeclaration cd : new ArrayList<>(cu.findAll(ConstructorDeclaration.class))) {
+            for (Parameter p : cd.getParameters()) {
+                if (playReq.equals(p.getType().asString())) {
+                    p.setType(StaticJavaParser.parseType("jakarta.servlet.http.HttpServletRequest"));
+                    any = true;
+                }
+            }
+        }
+        for (MethodDeclaration md : new ArrayList<>(cu.findAll(MethodDeclaration.class))) {
+            for (Parameter p : md.getParameters()) {
+                if (playReq.equals(p.getType().asString())) {
+                    p.setType(StaticJavaParser.parseType("jakarta.servlet.http.HttpServletRequest"));
+                    any = true;
+                }
+            }
+            Type rt = md.getType();
+            if (rt != null && !rt.isVoidType() && playReq.equals(rt.asString())) {
+                md.setType(StaticJavaParser.parseType("jakarta.servlet.http.HttpServletRequest"));
+                any = true;
+            }
+        }
+        for (FieldDeclaration fd : new ArrayList<>(cu.findAll(FieldDeclaration.class))) {
+            Type et = fd.getElementType();
+            if (playReq.equals(et.asString())) {
+                fd.setAllTypes(StaticJavaParser.parseType("jakarta.servlet.http.HttpServletRequest"));
+                any = true;
+            }
+        }
+        if (any) {
+            ensureImport(cu, "jakarta.servlet.http.HttpServletRequest");
+            result.appliedChanges.add("play.mvc.Http.Request -> jakarta.servlet.http.HttpServletRequest");
         }
         return any;
     }
