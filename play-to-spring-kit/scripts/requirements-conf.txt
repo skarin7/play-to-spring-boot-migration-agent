@@ -1,0 +1,3 @@
+# Optional: Play HOCON → Spring application.properties (conf_to_application_properties.py)
+# HOCON parser (PyPI package is 0.3.x; do not use 2.x — that is a different ecosystem)
+pyhocon>=0.3.50

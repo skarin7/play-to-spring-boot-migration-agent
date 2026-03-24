@@ -14,12 +14,47 @@ With **`--skip-build-toolkit`**, you must already have a **`*.jar`** in **`play-
 
 **Where to run from:** use the kit directory as your shell cwd, e.g. **`cd …/play-to-spring-kit`**, then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`**. The kit root (bootstrap script, **`lib/`**) is found via the script file path (**`__file__`**), not cwd. Relative **`--play-repo`** / **`--workspace`** values are resolved against **cwd**, so paths like **`../cms-content-service`** are correct when you launch from the kit directory.
 
+**Recommended from the monorepo root:** **`./start_upgrade.sh --play-repo …`** — uses **`play-to-spring-kit/.venv`** and **`scripts/requirements-venv.txt`** so optional deps (e.g. **`pyhocon`**) install without touching system Python. **`MIGRATION_SKIP_VENV_SYNC=1`** skips **`pip install`** on each run.
+
 ## Requirements
 
-- Python **3.10+**
+- Python **3.10+** (stdlib is enough for the orchestrator itself)
 - **`java`**, **`mvn`** on **`PATH`** (Maven required for the default **build-toolkit** step; omit if you use **`--skip-build-toolkit`** and keep a JAR in **`lib/`**)
 - **`dev-toolkit-*.jar`** ends up in **`play-to-spring-kit/lib/`** via the automatic build, or place it there yourself when using **`--skip-build-toolkit`**
 - **`cursor-agent`** on `PATH` if using LLM fixes (see Cursor docs for install)
+- **`pyhocon`** when using **`--export-play-conf`** or **`conf_to_application_properties.py`** — supplied automatically if you use **`start_upgrade.sh`** / **`requirements-venv.txt`** in **`play-to-spring-kit/.venv`**
+
+## Play `application.conf` → Spring `application.properties`
+
+Play uses HOCON (`conf/application.conf`, often with `include`). Spring expects `src/main/resources/application.properties` (flat keys). The kit ships **`scripts/conf_to_application_properties.py`**, which resolves includes, flattens nested objects to dot keys, and escapes values for `.properties`.
+
+Prefer the kit venv (created by repo **`start_upgrade.sh`**, or manually):
+
+```bash
+cd /path/to/play-to-spring-kit
+python3 -m venv .venv
+.venv/bin/python3 -m pip install -r scripts/requirements-venv.txt
+```
+
+On system Python only (PEP 668 may require **`--break-system-packages`**):
+
+```bash
+cd /path/to/play-to-spring-kit
+python3 -m pip install -r scripts/requirements-conf.txt --user --break-system-packages
+```
+
+Standalone:
+
+```bash
+python3 scripts/conf_to_application_properties.py \
+  -i /path/to/play-project/conf/application.conf \
+  -o /path/to/spring-project/src/main/resources/application.properties \
+  --strip-prefix akka.
+```
+
+**Orchestrator:** pass **`--export-play-conf`** (or **`MIGRATION_EXPORT_PLAY_CONF=1`**) to run the same conversion after `setup.sh` when **`spring_repo`** is known. **`akka.`** keys are stripped by default; add more prefixes with **`--conf-strip-prefix play.`** (repeatable). If `pyhocon` is missing, the step logs a warning and continues.
+
+You still need to **rename/map** keys for Spring (for example `mongodb.uri` → `spring.data.mongodb.uri`).
 
 ## Cursor / model
 
@@ -77,6 +112,8 @@ MIGRATION_VERBOSE=1 python3 scripts/migration_orchestrator.py --play-repo ../my-
 | `TIMEOUT_PER_LAYER_MINS` | Default 30 (wall clock per layer / per migration slice) |
 | `MAX_FILES_PER_CURSOR_SESSION` | Default 10 (batch errors by file) |
 | `MIGRATION_USE_SEMANTIC_LAYERS` | Set to `1` / `true` / `yes` for legacy **six-layer** `migrate-app --layer` loop (same as CLI `--use-semantic-layers`) |
+| `MIGRATION_EXPORT_PLAY_CONF` | Set to `1` / `true` / `yes` to run HOCON → `application.properties` export (same as `--export-play-conf`) |
+| `MIGRATION_SKIP_VENV_SYNC` | Set to `1` when using **`./start_upgrade.sh`**: do not run **`pip install`** (faster re-runs if **`play-to-spring-kit/.venv`** is already provisioned) |
 
 ## Paths (after workspace preparation)
 
@@ -139,6 +176,8 @@ Common flags:
 - `--skip-inventory` — do not scan Play `app/` for `source_inventory`
 - `--refresh-inventory` — recompute `source_inventory` and **rediscover** `migration_units` even if present
 - `--use-semantic-layers` — legacy: loop **model → … → other** using `migrate-app --layer` only (no path-prefix slicing)
+- `--export-play-conf` — after setup, write Spring `application.properties` from Play `conf/application.conf` (needs `pyhocon`; non-fatal if absent)
+- `--conf-strip-prefix PREFIX` — with `--export-play-conf`, omit extra HOCON key prefixes (repeatable); `akka.` is always omitted
 
 ## Migration units (default)
 

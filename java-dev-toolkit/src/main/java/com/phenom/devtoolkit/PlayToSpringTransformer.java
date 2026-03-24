@@ -92,6 +92,8 @@ public class PlayToSpringTransformer {
         public List<String> appliedChanges = new ArrayList<>();
         public List<String> warnings = new ArrayList<>();
         public List<String> errors = new ArrayList<>();
+        /** When set, {@code migrate-app} may emit {@code JacksonJson} under this package (e.g. {@code com.acme.utils}). */
+        public String jacksonJsonUtilsPackage;
     }
 
     private final JavaParser parser = new JavaParser();
@@ -171,6 +173,8 @@ public class PlayToSpringTransformer {
             // JUnit / util sources: same Play MVC cleanup as controllers (Result, Status.OK, Results.ok, imports).
             applyPlayMvcNonControllerRewrites(clazz, cu, input, result);
         }
+
+        SpringCompileFixups.apply(cu, clazz, layer, result);
 
         prunePlayLibsJsonImportIfUnused(cu, result);
         removePlayMvcImports(cu, result);

@@ -9,7 +9,9 @@ Only --play-repo is required (or PLAY_REPO). By default the script:
    monorepo, or ``JAVA_DEV_TOOLKIT_ROOT`` / ``--toolkit-root``).
 2. Copies ``dev-toolkit-*.jar`` into ``play-to-spring-kit/lib/``.
 3. Runs ``setup.sh`` (idempotent: skills, JAR into the play repo, workspace.yaml,
-   Spring dirs), seeds ``migration-status.json`` if missing, then if
+   Spring dirs). Optional ``--export-play-conf`` flattens Play ``conf/application.conf``
+   into Spring ``application.properties`` (needs ``pyhocon``). Then seeds
+   ``migration-status.json`` if missing, then if
    ``initialize.status`` is not ``done`` and ``CURSOR_API_KEY`` is set, spawns
    ``cursor-agent`` with **builder skill Step 1 only** to bootstrap ``pom.xml`` / compile.
    After init, continues **migrate-app** scoped by **folder-based migration units**
@@ -418,6 +420,60 @@ def run_setup_sh(
     if p.stderr:
         print(p.stderr, end="" if p.stderr.endswith("\n") else "\n", file=sys.stderr)
     return p.returncode
+
+
+def run_export_play_conf(
+    play_repo: Path,
+    spring_repo: Path,
+    extra_strip_prefixes: list[str],
+    dry_run: bool,
+) -> None:
+    """
+    Optionally flatten Play conf/application.conf into Spring application.properties.
+
+    Non-fatal: missing conf file, missing converter script, missing pyhocon, or converter
+    errors only log warnings. Always strips ``akka.`` keys; ``extra_strip_prefixes`` add more.
+    """
+    conf_path = play_repo / "conf" / "application.conf"
+    if not conf_path.is_file():
+        LOG.info("export-play-conf: skip (no %s)", conf_path)
+        return
+    script = scripts_dir() / "conf_to_application_properties.py"
+    if not script.is_file():
+        LOG.warning("export-play-conf: converter missing at %s (skipped)", script)
+        return
+    out_path = spring_repo / "src" / "main" / "resources" / "application.properties"
+    cmd: list[str] = [sys.executable, str(script), "-i", str(conf_path), "-o", str(out_path)]
+    for raw in ["akka."] + list(extra_strip_prefixes or []):
+        p = raw.strip()
+        if p:
+            cmd.extend(["--strip-prefix", p])
+    if dry_run:
+        LOG.info("[dry-run] %s", " ".join(shlex.quote(a) for a in cmd))
+        return
+    proc = subprocess.run(
+        cmd,
+        cwd=str(kit_root()),
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout:
+        LOG.info("%s", proc.stdout.rstrip())
+    if proc.stderr:
+        LOG.info("%s", proc.stderr.rstrip())
+    if proc.returncode == 2:
+        req = scripts_dir() / "requirements-conf.txt"
+        LOG.warning(
+            "export-play-conf: pyhocon not installed (skipped). "
+            "Use repo ./start_upgrade.sh (kit .venv) or: python3 -m pip install -r %s",
+            req,
+        )
+        return
+    if proc.returncode != 0:
+        LOG.warning(
+            "export-play-conf: converter exited with code %s (continuing)",
+            proc.returncode,
+        )
 
 
 LAYER_ORDER = (
@@ -1538,6 +1594,25 @@ def main() -> int:
             "Or set MIGRATION_USE_SEMANTIC_LAYERS=1."
         ),
     )
+    parser.add_argument(
+        "--export-play-conf",
+        action="store_true",
+        help=(
+            "After setup, run scripts/conf_to_application_properties.py: Play conf/application.conf "
+            "→ Spring src/main/resources/application.properties (requires pyhocon; non-fatal if missing). "
+            "Or set MIGRATION_EXPORT_PLAY_CONF=1."
+        ),
+    )
+    parser.add_argument(
+        "--conf-strip-prefix",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "With --export-play-conf: extra HOCON key prefixes to omit (repeatable). "
+            "akka. is always stripped."
+        ),
+    )
     parser.add_argument("--max-retries-per-layer", type=int, default=5)
     parser.add_argument("--max-total-llm-calls", type=int, default=50)
     parser.add_argument("--max-errors-llm", type=int, default=10)
@@ -1586,6 +1661,16 @@ def main() -> int:
         spring_repo = resolve_spring_repo(play_repo, workspace_dir, args.spring_name)
 
     spring_repo = spring_repo.resolve()
+    export_conf = bool(args.export_play_conf) or os.environ.get(
+        "MIGRATION_EXPORT_PLAY_CONF", ""
+    ).lower() in ("1", "true", "yes")
+    if export_conf:
+        run_export_play_conf(
+            play_repo,
+            spring_repo,
+            list(args.conf_strip_prefix or []),
+            args.dry_run,
+        )
     status_path = resolve_status_path(spring_repo, args.status_file)
     cursor_workspace = resolve_cursor_agent_workspace(play_repo, spring_repo, workspace_dir)
     cursor_force = resolve_cursor_force(args)

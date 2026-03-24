@@ -348,6 +348,16 @@ public class DevToolkitCLI implements Callable<Integer> {
                     System.out.println("Wrote report: " + report);
                 }
 
+                java.util.LinkedHashSet<String> jacksonUtilsPackages = new java.util.LinkedHashSet<>();
+                for (PlayToSpringTransformer.TransformResult r : results) {
+                    if (r.jacksonJsonUtilsPackage != null && !r.jacksonJsonUtilsPackage.isEmpty()) {
+                        jacksonUtilsPackages.add(r.jacksonJsonUtilsPackage);
+                    }
+                }
+                for (String utilsPkg : jacksonUtilsPackages) {
+                    JacksonJsonTemplate.writeIfAbsent(javaRoot, utilsPkg, dryRun);
+                }
+
                 long failed = results.stream().filter(r -> !r.errors.isEmpty()).count();
                 String layerInfo = filterLayer != null ? " (layer=" + filterLayer + ")" : "";
                 String prefixInfo = normalizedPrefixes.isEmpty() ? "" : " (path-prefix=" + String.join("|", normalizedPrefixes) + ")";
