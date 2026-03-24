@@ -277,6 +277,15 @@ public class DevToolkitCLI implements Callable<Integer> {
         @Option(names = {"--layer"}, description = "Filter to one layer: model, repository, manager, service, controller, other. When not set, all layers are processed.")
         private String layerFilter;
 
+        @Option(
+                names = {"--path-prefix"},
+                arity = "0..*",
+                description = "Relative to app/: only migrate sources whose path equals or is under this prefix. "
+                        + "Repeat the option or use comma-separated values. Applies to app/ only, not test trees. "
+                        + "When omitted, all app/ Java files are candidates."
+        )
+        private List<String> pathPrefixes;
+
         @Option(names = {"--batch-size"}, description = "Max files to process in this invocation (default: all). Skips files already migrated to target.")
         private int batchSize = -1;
 
@@ -308,13 +317,16 @@ public class DevToolkitCLI implements Callable<Integer> {
                     requestedLayer = LayerDetector.fromString(layerFilter);
                 }
 
+                List<String> normalizedPrefixes = normalizePathPrefixes(pathPrefixes);
+
                 PlayToSpringTransformer transformer = new PlayToSpringTransformer();
                 List<PlayToSpringTransformer.TransformResult> results = new ArrayList<>();
                 final LayerDetector.Layer filterLayer = requestedLayer;
                 int[] skippedCount = {0};
                 int[] remainingCount = {0};
 
-                processPlayJavaTree(appDir, javaRoot, transformer, results, filterLayer, skippedCount, remainingCount,
+                processPlayJavaTree(appDir, javaRoot, transformer, results, filterLayer, normalizedPrefixes,
+                        skippedCount, remainingCount,
                         batchSize, dryRun, PlayToSpringTransformer.PlayMigrationSource.APPLICATION, "app");
 
                 Optional<Path> playTestRoot = PlayToSpringTransformer.resolvePlayTestJavaSourceRoot(sourcePath);
@@ -323,6 +335,7 @@ public class DevToolkitCLI implements Callable<Integer> {
                         Files.createDirectories(springTestRoot);
                     }
                     processPlayJavaTree(playTestRoot.get(), springTestRoot, transformer, results, filterLayer,
+                            java.util.Collections.emptyList(),
                             skippedCount, remainingCount, batchSize, dryRun,
                             PlayToSpringTransformer.PlayMigrationSource.TEST, "test");
                 }
@@ -337,7 +350,8 @@ public class DevToolkitCLI implements Callable<Integer> {
 
                 long failed = results.stream().filter(r -> !r.errors.isEmpty()).count();
                 String layerInfo = filterLayer != null ? " (layer=" + filterLayer + ")" : "";
-                System.out.println("✅ migrate-app done: " + results.size() + " files, " + failed + " errors, " + remainingCount[0] + " remaining" + layerInfo);
+                String prefixInfo = normalizedPrefixes.isEmpty() ? "" : " (path-prefix=" + String.join("|", normalizedPrefixes) + ")";
+                System.out.println("✅ migrate-app done: " + results.size() + " files, " + failed + " errors, " + remainingCount[0] + " remaining" + layerInfo + prefixInfo);
                 return failed > 0 ? 1 : 0;
             } catch (Exception e) {
                 System.err.println("❌ Error during migrate-app: " + e.getMessage());
@@ -358,12 +372,79 @@ public class DevToolkitCLI implements Callable<Integer> {
             return sourcePath.getParent().resolve("spring-" + basename);
         }
 
+        /**
+         * Normalize {@code --path-prefix} values: forward slashes, trim, strip leading {@code ./} and {@code /}.
+         * Empty after trim means whole tree (caller usually skips adding empty strings).
+         */
+        static List<String> normalizePathPrefixes(List<String> rawList) {
+            List<String> out = new ArrayList<>();
+            if (rawList == null) {
+                return out;
+            }
+            for (String raw : rawList) {
+                if (raw == null || raw.trim().isEmpty()) {
+                    continue;
+                }
+                for (String piece : raw.split(",")) {
+                    String n = normalizeSinglePathPrefix(piece);
+                    if (!n.isEmpty() && !out.contains(n)) {
+                        out.add(n);
+                    }
+                }
+            }
+            return out;
+        }
+
+        static String normalizeSinglePathPrefix(String raw) {
+            if (raw == null) {
+                return "";
+            }
+            String s = raw.trim().replace('\\', '/');
+            while (s.startsWith("./")) {
+                s = s.substring(2);
+            }
+            while (s.startsWith("/")) {
+                s = s.substring(1);
+            }
+            while (s.endsWith("/") && s.length() > 1) {
+                s = s.substring(0, s.length() - 1);
+            }
+            return s;
+        }
+
+        /**
+         * True if {@code relativePathUnderSource} is exactly {@code prefix} or under {@code prefix/}.
+         */
+        static boolean matchesPathPrefix(String relativePathUnderSource, String prefix) {
+            if (prefix == null || prefix.isEmpty()) {
+                return true;
+            }
+            String rel = relativePathUnderSource.replace('\\', '/');
+            if (rel.equals(prefix)) {
+                return true;
+            }
+            return rel.startsWith(prefix + "/");
+        }
+
+        static boolean matchesAnyPathPrefix(String relativePathUnderSource, List<String> prefixes) {
+            if (prefixes == null || prefixes.isEmpty()) {
+                return true;
+            }
+            for (String p : prefixes) {
+                if (matchesPathPrefix(relativePathUnderSource, p)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private void processPlayJavaTree(
                 Path sourceRoot,
                 Path targetRoot,
                 PlayToSpringTransformer transformer,
                 List<PlayToSpringTransformer.TransformResult> results,
                 LayerDetector.Layer filterLayer,
+                List<String> pathPrefixFilters,
                 int[] skippedCount,
                 int[] remainingCount,
                 int batchSize,
@@ -380,6 +461,10 @@ public class DevToolkitCLI implements Callable<Integer> {
 
             for (Path p : candidates) {
                 Path rel = sourceRoot.relativize(p);
+                String relSlash = rel.toString().replace('\\', '/');
+                if (!matchesAnyPathPrefix(relSlash, pathPrefixFilters)) {
+                    continue;
+                }
                 Path outPath = targetRoot.resolve(rel);
                 LayerDetector.Layer detectedLayer = PlayToSpringTransformer.migrationLayer(rel, migrationSource);
 

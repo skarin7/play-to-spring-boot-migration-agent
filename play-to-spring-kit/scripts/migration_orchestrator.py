@@ -9,7 +9,13 @@ Only --play-repo is required (or PLAY_REPO). By default the script:
    monorepo, or ``JAVA_DEV_TOOLKIT_ROOT`` / ``--toolkit-root``).
 2. Copies ``dev-toolkit-*.jar`` into ``play-to-spring-kit/lib/``.
 3. Runs ``setup.sh`` (idempotent: skills, JAR into the play repo, workspace.yaml,
-   Spring dirs), then continues migrate / compile / optional cursor-agent.
+   Spring dirs), seeds ``migration-status.json`` if missing, then if
+   ``initialize.status`` is not ``done`` and ``CURSOR_API_KEY`` is set, spawns
+   ``cursor-agent`` with **builder skill Step 1 only** to bootstrap ``pom.xml`` / compile.
+   After init, continues **migrate-app** scoped by **folder-based migration units**
+   (``--path-prefix``) by default, or legacy **semantic layers** (``--layer``) when
+   ``--use-semantic-layers`` / ``MIGRATION_USE_SEMANTIC_LAYERS=1``; then compile and
+   optional cursor-agent for fixes.
 
 Use ``--skip-build-toolkit`` if the JAR is already in ``lib/``.
 
@@ -17,6 +23,15 @@ Intended usage: from the monorepo, ``cd play-to-spring-kit`` and run
 ``python3 scripts/migration_orchestrator.py --play-repo ../your-play-app``.
 Kit paths come from ``__file__`` (not cwd); ``--play-repo`` / ``--workspace`` are
 resolved relative to the shell's current working directory.
+
+**Cursor Agent (CLI) vs IDE chat:** the script runs ``cursor-agent -p`` headlessly. The IDE
+loads Agent Skills from ``.cursor/skills/`` when you pick a skill; the CLI only sees text we
+put in the prompt (we inline builder Step 1 for bootstrap). The CLI ``--workspace`` must
+include **both** Play and Spring trees when they are siblings under the migration workspace
+(default: parent of the Play repo)—otherwise the agent behaves unlike a multi-root or
+parent-folder IDE window. Use ``--cursor-force`` or ``CURSOR_AGENT_FORCE=1`` if terminal
+commands block on approval. Set ``CURSOR_AGENT_WORKSPACE`` to an absolute path to override
+``--workspace`` for unusual layouts.
 
 Exit codes: 0 OK, 1 unexpected error, 2 stuck compile (no cursor), 3 init not done,
             4 budget exhausted, 5 fail-fast failure.
@@ -26,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shlex
@@ -33,6 +49,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +62,64 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 DEFAULT_CURSOR_MODEL = "composer-2"
+
+LOG = logging.getLogger("migration_orchestrator")
+
+
+def configure_logging(verbose: bool = False) -> None:
+    """
+    Log to stderr. Call once after parsing CLI (or set MIGRATION_VERBOSE=1).
+    INFO: milestones + streamed cursor-agent lines; DEBUG: extra diagnostics.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    LOG.setLevel(level)
+    if LOG.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [migration] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    LOG.addHandler(handler)
+    LOG.propagate = False
+
+
+def _heartbeat_while_process_runs(proc: subprocess.Popen, label: str, interval_sec: float = 30.0) -> None:
+    """Background: log periodically while cursor-agent is still running."""
+    start = time.monotonic()
+    while proc.poll() is None:
+        time.sleep(interval_sec)
+        if proc.poll() is not None:
+            break
+        elapsed = time.monotonic() - start
+        LOG.info(
+            "%s: still running (%.0f s elapsed, pid=%s) — agent output appears above as it arrives.",
+            label,
+            elapsed,
+            proc.pid,
+        )
+
+
+def _drain_stream(pipe, buf: list[str], stream_label: str) -> None:
+    """Read lines from cursor-agent stdout/stderr; log each line in real time."""
+    try:
+        assert pipe is not None
+        for line in iter(pipe.readline, ""):
+            buf.append(line)
+            text = line.rstrip()
+            if not text:
+                continue
+            if stream_label == "stderr":
+                LOG.warning("[cursor-agent stderr] %s", text)
+            else:
+                LOG.info("[cursor-agent stdout] %s", text)
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
 
 def abs_path(p: Path) -> Path:
@@ -193,9 +268,25 @@ def parse_workspace_yaml(yaml_path: Path) -> dict[str, str]:
             "batch_size",
             "base_package",
             "kit_path",
+            "migration_unit_root",
         ):
             out[key] = val
     return out
+
+
+def normalize_spring_repo_str(raw: str, workspace_dir: Path) -> Path:
+    """
+    Resolve spring_repo from workspace.yaml. Fixes POSIX expanduser('~//x') -> '//x'.
+    """
+    s = raw.strip().strip('"').strip("'")
+    s = os.path.expanduser(s)
+    if s.startswith("//") and not s.startswith("///") and len(s) > 2:
+        rest = s[2:].lstrip("/")
+        s = str(Path.home() / rest) if rest else str(Path.home())
+    p = Path(s)
+    if p.is_absolute():
+        return p.resolve()
+    return (workspace_dir / p).resolve()
 
 
 def resolve_spring_repo(
@@ -210,12 +301,11 @@ def resolve_spring_repo(
     ws_yaml = workspace_dir / "workspace.yaml"
     data = parse_workspace_yaml(ws_yaml)
     if data.get("spring_repo"):
-        spr = Path(data["spring_repo"]).expanduser()
-        spr = spr.resolve() if spr.is_absolute() else (workspace_dir / spr).resolve()
+        spr = normalize_spring_repo_str(data["spring_repo"], workspace_dir)
         declared = data.get("play_repo")
         if declared:
             try:
-                decl_p = Path(declared).expanduser().resolve()
+                decl_p = normalize_spring_repo_str(declared, workspace_dir)
                 if decl_p != play_repo.resolve():
                     print(
                         "[warn] workspace.yaml play_repo does not match --play-repo; "
@@ -243,7 +333,54 @@ def resolve_status_path(
     env_p = os.environ.get("MIGRATION_STATUS_FILE")
     if env_p:
         return abs_path(Path(env_p))
-    return (spring_repo / "migration-status.json").resolve(strict=False)
+    base = spring_repo if spring_repo.is_absolute() else spring_repo.resolve()
+    return (base / "migration-status.json").resolve(strict=False)
+
+
+def cursor_agent_workspace_root(
+    play_repo: Path,
+    spring_repo: Path,
+    workspace_dir: Path,
+) -> Path:
+    """
+    Directory for ``cursor-agent --workspace``: should contain both Play and Spring when
+    possible (default kit layout: both under ``workspace_dir``).
+    """
+    w = workspace_dir.resolve()
+    pr = play_repo.resolve()
+    sr = spring_repo.resolve()
+
+    def is_under(root: Path, p: Path) -> bool:
+        try:
+            p.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    if is_under(w, pr) and is_under(w, sr):
+        return w
+    parent = pr.parent
+    if is_under(parent, pr) and is_under(parent, sr):
+        return parent
+    if is_under(pr, sr):
+        return pr
+    if is_under(sr, pr):
+        return sr
+    if is_under(w, pr):
+        return w
+    return pr
+
+
+def resolve_cursor_agent_workspace(
+    play_repo: Path,
+    spring_repo: Path,
+    workspace_dir: Path,
+) -> Path:
+    """``CURSOR_AGENT_WORKSPACE`` override, else shared root from ``cursor_agent_workspace_root``."""
+    raw = os.environ.get("CURSOR_AGENT_WORKSPACE", "").strip()
+    if raw:
+        return abs_path(Path(raw))
+    return cursor_agent_workspace_root(play_repo, spring_repo, workspace_dir)
 
 
 def run_setup_sh(
@@ -373,6 +510,261 @@ def scan_spring_java(spring_root: Path) -> tuple[int, dict[str, int]]:
     return total, by_layer
 
 
+CONTROLLER_DIR_NAMES = frozenset({"controllers", "controller"})
+
+
+def normalize_path_prefix(raw: str) -> str:
+    """Match dev-toolkit: relative to app/, forward slashes, trim slashes."""
+    if not raw:
+        return ""
+    s = raw.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    while s.startswith("/"):
+        s = s[1:]
+    while s.endswith("/") and len(s) > 1:
+        s = s[:-1]
+    return s
+
+
+def _count_java_files(root: Path) -> int:
+    if not root.is_dir():
+        return 0
+    return sum(1 for p in root.rglob("*.java") if p.is_file())
+
+
+def _immediate_subdirs(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    return sorted((p for p in path.iterdir() if p.is_dir()), key=lambda p: p.name.lower())
+
+
+def _rel_posix_from_app(app_dir: Path, p: Path) -> str:
+    return p.resolve().relative_to(app_dir.resolve()).as_posix()
+
+
+def _units_from_parent_p(app_dir: Path, parent_p: Path) -> list[str]:
+    """One path_prefix per immediate child dir with Java; optional prefix for .java files directly in parent_p."""
+    prefixes: list[str] = []
+    for d in _immediate_subdirs(parent_p):
+        if _count_java_files(d) > 0:
+            prefixes.append(_rel_posix_from_app(app_dir, d))
+    loose = [f for f in parent_p.glob("*.java") if f.is_file()]
+    if loose:
+        root_px = _rel_posix_from_app(app_dir, parent_p)
+        if root_px not in prefixes:
+            prefixes.append(root_px)
+    return sorted(set(prefixes))
+
+
+def _score_split_parent(app_dir: Path, parent_p: Path) -> tuple[int, int, int]:
+    subs = _immediate_subdirs(parent_p)
+    with_java = sum(1 for s in subs if _count_java_files(s) > 0)
+    total = _count_java_files(parent_p)
+    depth = len(parent_p.resolve().relative_to(app_dir.resolve()).parts)
+    return (with_java, total, depth)
+
+
+def _find_controller_anchor_parents(app_dir: Path) -> list[Path]:
+    """Directories P such that P/controllers or P/controller exists."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for dirpath, dirnames, _filenames in os.walk(app_dir, topdown=True):
+        root_p = Path(dirpath)
+        lower_map = {d.lower(): d for d in dirnames}
+        for cn in CONTROLLER_DIR_NAMES:
+            if cn in lower_map:
+                child = root_p / lower_map[cn]
+                if child.is_dir():
+                    key = str(root_p.resolve())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(root_p)
+                break
+    return found
+
+
+def _pick_best_parent(app_dir: Path, candidates: list[Path]) -> Path | None:
+    if not candidates:
+        return None
+    best: Path | None = None
+    best_key: tuple[int, int, int] | None = None
+    for p in candidates:
+        k = _score_split_parent(app_dir, p)
+        if best is None or k > best_key:  # type: ignore[operator]
+            best = p
+            best_key = k
+    return best
+
+
+def _fallback_branch_parent(app_dir: Path) -> Path | None:
+    """Descend through ≤2-wide chains until a directory has ≥3 subdirs."""
+    cur = app_dir.resolve()
+    app_res = app_dir.resolve()
+    while True:
+        subs = _immediate_subdirs(cur)
+        if len(subs) >= 3:
+            return cur
+        if len(subs) == 0:
+            return None
+        if len(subs) == 1:
+            cur = subs[0]
+            continue
+        subs.sort(key=lambda s: (-_count_java_files(s), s.as_posix().lower()))
+        cur = subs[0]
+        if not str(cur.resolve()).startswith(str(app_res)):
+            return None
+
+
+def discover_migration_units(
+    play_root: Path,
+    *,
+    java_subdir: str = "app",
+    migration_unit_root: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Filesystem-derived migration units: path_prefix relative to play ``app/``.
+    See kit plan: controllers-folder anchor, ≥3-subdir fallback, optional workspace override.
+    """
+    app_dir = (play_root / java_subdir).resolve()
+    if not app_dir.is_dir():
+        return [
+            {
+                "id": "app_root",
+                "path_prefix": "",
+                "java_file_count": 0,
+                "discovered_by": "empty_app",
+            }
+        ]
+
+    forced = normalize_path_prefix((migration_unit_root or "").strip())
+    if forced:
+        p_forced = (app_dir / forced.replace("/", os.sep)).resolve()
+        try:
+            p_forced.relative_to(app_dir)
+        except ValueError:
+            p_forced = app_dir
+        if p_forced.is_dir():
+            prefs = _units_from_parent_p(app_dir, p_forced)
+            if not prefs:
+                prefs = [forced] if _count_java_files(p_forced) > 0 else []
+            if not prefs:
+                prefs = [""]
+            out = []
+            for px in prefs:
+                cnt = _count_java_files(app_dir / px.replace("/", os.sep)) if px else _count_java_files(app_dir)
+                uid = (px or "app_root").replace("/", "_").replace("\\", "_")
+                out.append(
+                    {
+                        "id": uid,
+                        "path_prefix": px,
+                        "java_file_count": cnt,
+                        "discovered_by": "migration_unit_root",
+                    }
+                )
+            return out
+
+    triggers = _find_controller_anchor_parents(app_dir)
+    best_p = _pick_best_parent(app_dir, triggers)
+    if best_p is not None:
+        prefs = _units_from_parent_p(app_dir, best_p)
+        if prefs:
+            out = []
+            for px in prefs:
+                cnt = _count_java_files(app_dir / px.replace("/", os.sep))
+                uid = px.replace("/", "_").replace("\\", "_") if px else "app_root"
+                out.append(
+                    {
+                        "id": uid,
+                        "path_prefix": px,
+                        "java_file_count": cnt,
+                        "discovered_by": "controllers_anchor",
+                    }
+                )
+            return out
+
+    branch = _fallback_branch_parent(app_dir)
+    if branch is not None:
+        prefs = []
+        for d in _immediate_subdirs(branch):
+            if _count_java_files(d) > 0:
+                prefs.append(_rel_posix_from_app(app_dir, d))
+        loose = [f for f in branch.glob("*.java") if f.is_file()]
+        if loose:
+            rp = _rel_posix_from_app(app_dir, branch)
+            if rp not in prefs:
+                prefs.append(rp)
+        prefs = sorted(set(prefs))
+        if prefs:
+            out = []
+            for px in prefs:
+                cnt = _count_java_files(app_dir / px.replace("/", os.sep))
+                uid = px.replace("/", "_").replace("\\", "_")
+                out.append(
+                    {
+                        "id": uid,
+                        "path_prefix": px,
+                        "java_file_count": cnt,
+                        "discovered_by": "three_plus_subdirs",
+                    }
+                )
+            return out
+
+    total = _count_java_files(app_dir)
+    return [
+        {
+            "id": "app_root",
+            "path_prefix": "",
+            "java_file_count": total,
+            "discovered_by": "whole_app",
+        }
+    ]
+
+
+def default_unit_entry(
+    unit_id: str,
+    path_prefix: str,
+    java_file_count: int,
+) -> dict[str, Any]:
+    base = default_layer_entry()
+    base["id"] = unit_id
+    base["path_prefix"] = path_prefix
+    base["java_file_count"] = int(java_file_count)
+    return base
+
+
+def merge_discovered_migration_units(
+    existing: list[dict[str, Any]] | None,
+    discovered: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve per-unit progress; refresh path_prefix/java_file_count from disk."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for u in existing or []:
+        uid = u.get("id")
+        if uid:
+            by_id[str(uid)] = dict(u)
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for d in discovered:
+        uid = str(d["id"])
+        seen_ids.add(uid)
+        fresh = default_unit_entry(uid, str(d.get("path_prefix", "")), int(d.get("java_file_count", 0)))
+        if uid in by_id:
+            old = by_id[uid]
+            merged = {**fresh, **old}
+            merged["path_prefix"] = fresh["path_prefix"]
+            merged["java_file_count"] = fresh["java_file_count"]
+            merged["id"] = uid
+            out.append(merged)
+        else:
+            fresh["discovered_by"] = d.get("discovered_by")
+            out.append(fresh)
+    for uid, old in by_id.items():
+        if uid not in seen_ids and old.get("status") == "done":
+            out.append(old)
+    return sorted(out, key=lambda u: (u.get("path_prefix") or ""))
+
+
 def default_layer_entry() -> dict[str, Any]:
     return {
         "status": "pending",
@@ -426,6 +818,23 @@ def merge_status(raw: dict[str, Any]) -> dict[str, Any]:
 
     out.setdefault("source_inventory", None)
     out.setdefault("migration_verification", None)
+
+    raw_mu = out.get("migration_units")
+    if raw_mu is None:
+        out.setdefault("migration_units", None)
+    elif isinstance(raw_mu, list):
+        merged_list: list[dict[str, Any]] = []
+        for u in raw_mu:
+            if not isinstance(u, dict):
+                continue
+            uid = str(u.get("id") or "unit")
+            px = str(u.get("path_prefix", ""))
+            jc = int(u.get("java_file_count", 0))
+            merged_list.append({**default_unit_entry(uid, px, jc), **u})
+        out["migration_units"] = merged_list
+    else:
+        out["migration_units"] = None
+
     return out
 
 
@@ -497,6 +906,17 @@ def resolve_model(args: argparse.Namespace, status: dict[str, Any]) -> str:
     return DEFAULT_CURSOR_MODEL
 
 
+def resolve_cursor_force(args: argparse.Namespace) -> bool:
+    """Match IDE-style command approval: ``cursor-agent --force`` for headless runs."""
+    if getattr(args, "cursor_force", False):
+        return True
+    return os.environ.get("CURSOR_AGENT_FORCE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 @dataclass
 class Guardrails:
     max_retries_per_layer: int = 5
@@ -541,6 +961,17 @@ def load_guardrails(args: argparse.Namespace, status: dict[str, Any]) -> Guardra
         cursor_agent_timeout_sec=int(
             os.environ.get("CURSOR_AGENT_TIMEOUT_SEC", "1800")
         ),
+    )
+
+
+def use_semantic_layer_mode(args: argparse.Namespace) -> bool:
+    """Legacy loop over six semantic layers (``--layer`` only). Default is path-based migration units."""
+    if getattr(args, "use_semantic_layers", False):
+        return True
+    return os.environ.get("MIGRATION_USE_SEMANTIC_LAYERS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
 
 
@@ -610,47 +1041,307 @@ def call_cursor_agent(
     api_key: str,
     timeout_sec: int,
     dry_run: bool,
+    cwd: Path | None = None,
+    *,
+    workspace: Path | None = None,
+    force: bool = False,
+    stream_output: bool = True,
+    run_label: str = "cursor-agent",
 ) -> subprocess.CompletedProcess[str]:
-    argv = [
+    # Flags per https://cursor.com/docs/cli/reference/parameters
+    argv: list[str] = [
         "cursor-agent",
         "-p",
-        "-m",
-        model,
+        # Non-interactive runs must trust the workspace (otherwise CLI exits with a prompt).
+        "--trust",
         "--output-format",
         "json",
         "--api-key",
         api_key,
-        prompt,
+        "--model",
+        model,
     ]
+    if force:
+        argv.append("--force")
+    ws = workspace if workspace is not None else cwd
+    if ws is not None:
+        argv.extend(["--workspace", str(ws.resolve())])
+    argv.append(prompt)
+
     if dry_run:
-        print("[dry-run]", "cursor-agent ...", file=sys.stderr)
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
-    return subprocess.run(
+        LOG.info("[dry-run] would run cursor-agent (%s, prompt=%d chars)", run_label, len(prompt))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    which = shutil.which("cursor-agent")
+    if which:
+        LOG.info("cursor-agent on PATH: %s", which)
+    else:
+        LOG.error(
+            "cursor-agent not found on PATH — install the Cursor CLI / agent so `cursor-agent` is available."
+        )
+
+    preview = prompt[:240] + "…" if len(prompt) > 240 else prompt
+    proc_cwd = str((cwd or ws).resolve()) if (cwd or ws) is not None else None
+    LOG.info(
+        "starting %s: model=%s timeout=%ds cursor_workspace=%s proc_cwd=%s force=%s prompt_chars=%d preview=%r",
+        run_label,
+        model,
+        timeout_sec,
+        ws,
+        proc_cwd,
+        force,
+        len(prompt),
+        preview,
+    )
+    LOG.debug("full argv (api key redacted): %s", _argv_repr_redacted(argv))
+
+    if not stream_output:
+        LOG.info("%s: streaming disabled; capturing output until process exits.", run_label)
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            cwd=proc_cwd,
+        )
+    proc = subprocess.Popen(
         argv,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_sec,
+        bufsize=1,
+        cwd=proc_cwd,
+    )
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+    t_out = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stdout, out_buf, "stdout"),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, err_buf, "stderr"),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
+    hb = threading.Thread(
+        target=_heartbeat_while_process_runs,
+        args=(proc, run_label),
+        daemon=True,
+    )
+    hb.start()
+
+    ret: int | None
+    try:
+        ret = proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "%s: TIMEOUT after %ds — sending kill to pid %s",
+            run_label,
+            timeout_sec,
+            proc.pid,
+        )
+        proc.kill()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            LOG.error("%s: process did not exit after kill", run_label)
+        ret = proc.returncode if proc.returncode is not None else -1
+
+    t_out.join(timeout=30)
+    t_err.join(timeout=30)
+
+    stdout = "".join(out_buf)
+    stderr = "".join(err_buf)
+    LOG.info(
+        "%s: finished exit_code=%s captured_stdout_chars=%d stderr_chars=%d",
+        run_label,
+        ret,
+        len(stdout),
+        len(stderr),
+    )
+    if ret != 0:
+        LOG.warning(
+            "%s: non-zero exit — if output was empty, run with -v / MIGRATION_VERBOSE=1 for DEBUG.",
+            run_label,
+        )
+    return subprocess.CompletedProcess(argv, int(ret if ret is not None else 1), stdout, stderr)
+
+
+def _argv_repr_redacted(argv: list[str]) -> str:
+    out: list[str] = []
+    skip_next = False
+    for i, a in enumerate(argv):
+        if skip_next:
+            out.append("***")
+            skip_next = False
+            continue
+        if a == "--api-key" and i + 1 < len(argv):
+            out.append("--api-key")
+            skip_next = True
+            continue
+        out.append(a)
+    return " ".join(shlex.quote(x) for x in out)
+
+
+_BUILDER_STEP1_HEADING = "## Step 1: Initialize Spring project"
+_BUILDER_STEP2_HEADING = "\n## Step 2:"
+
+
+def extract_builder_skill_step1_only(skill_markdown: str) -> str | None:
+    """Return only the Initialize section from play-spring-builder SKILL.md."""
+    i = skill_markdown.find(_BUILDER_STEP1_HEADING)
+    if i == -1:
+        return None
+    j = skill_markdown.find(_BUILDER_STEP2_HEADING, i + len(_BUILDER_STEP1_HEADING))
+    if j == -1:
+        return skill_markdown[i:].strip()
+    return skill_markdown[i:j].strip()
+
+
+def load_builder_skill_step1_markdown(play_repo: Path) -> str:
+    """
+    Load builder skill from the play repo or kit, but only Step 1 (init).
+
+    Bootstrapping used to inline the full orchestrator skill, which describes
+    migrate-app and per-layer loops; agents followed that and never finished init.
+    """
+    candidates = [
+        play_repo / ".cursor/skills/play-spring-builder/SKILL.md",
+        kit_root() / "skills/builder-skill.md",
+    ]
+    for p in candidates:
+        if not p.is_file():
+            continue
+        full = p.read_text(encoding="utf-8", errors="replace")
+        chunk = extract_builder_skill_step1_only(full)
+        if chunk:
+            return chunk
+        LOG.warning("Builder skill at %s missing %r section; using full file.", p, _BUILDER_STEP1_HEADING)
+        return full.strip()
+    return (
+        f"# Missing builder skill. Run setup.sh.\n"
+        f"# Expected: {candidates[0]} or {candidates[1]}\n"
     )
 
 
-def run_migrate_layer(
+def bootstrap_initialize_via_cursor_agent(
+    *,
+    play_repo: Path,
+    spring_repo: Path,
+    cursor_workspace: Path,
+    cursor_force: bool,
+    status_path: Path,
+    model: str,
+    api_key: str,
+    timeout_sec: int,
+    dry_run: bool,
+    max_attempts: int = 2,
+) -> bool:
+    """
+    Spawn cursor-agent for Spring init only (builder Step 1), not full orchestration.
+
+    Returns True if afterward initialize.status == done in migration-status.json.
+    """
+    skill_md = load_builder_skill_step1_markdown(play_repo)
+    prompt = f"""You are invoked by the Play→Spring **migration_orchestrator.py** script (headless, non-interactive).
+
+## Task — bootstrap / init ONLY (then STOP)
+
+Complete **Step 1: Initialize Spring project** and **finish**. Do not run a full migration in this session.
+
+1. Ensure `{status_path}` exists and keeps the skill schema (`initialize`, `layers`, optional `migration_units`, etc.).
+2. Under **`{spring_repo}`**, create **`pom.xml`**, **`Application.java`**, and **`application.properties`** from the Play project's **`build.sbt`** and **`conf/application.conf`** (Play is **read-only**). Use **`base_package`** from **`workspace.yaml`** where the skill says to.
+3. Run **`mvn -q compile`** with `{spring_repo}` as the working directory; fix **Spring-only** issues until compile succeeds (an empty Spring app besides `Application.java` should build).
+4. Set in `{status_path}`: **`initialize.status` = `done`**, and `pom_generated` / `application_java_generated` / `application_properties_generated` = true. Keep **`current_step`** = **`initialize`** (the Python script advances it later).
+5. **Do not** fill **`source_inventory`** here — the orchestrator script runs `scan_play_java` next unless disabled.
+
+## FORBIDDEN in this run (will waste time or hang the pipeline)
+
+- **`java -jar`** … **`migrate-app`** (including **`--layer`** or **`--path-prefix`**), or any dev-toolkit transform CLI
+- Orchestrator **Step 2 / Step 3** (per-slice / per-layer transform, verification pass)
+- Reading or following **play-spring-orchestrator** for full migration loops (not loaded in this prompt on purpose)
+
+## Absolute paths
+- **Cursor CLI workspace root** (contains both projects — same idea as opening this folder in the IDE): `{cursor_workspace}`
+- Play repo: `{play_repo}`
+- Spring repo: `{spring_repo}`
+- State file: `{status_path}`
+
+## Reference: play-spring-builder — Step 1 only
+{skill_md}
+"""
+    for attempt in range(1, max_attempts + 1):
+        label = f"spring-bootstrap attempt {attempt}/{max_attempts}"
+        LOG.info(
+            "Invoking cursor-agent for %s (timeout %ds). "
+            "Live lines are prefixed with [cursor-agent stdout] / [cursor-agent stderr]; "
+            "heartbeat every 30s if still running.",
+            label,
+            timeout_sec,
+        )
+        proc = call_cursor_agent(
+            model,
+            prompt,
+            api_key,
+            timeout_sec,
+            dry_run,
+            workspace=cursor_workspace,
+            cwd=cursor_workspace,
+            force=cursor_force,
+            run_label=label,
+        )
+        if proc.returncode != 0:
+            LOG.warning("cursor-agent exit code %s for %s", proc.returncode, label)
+        if status_path.is_file():
+            try:
+                raw = json.loads(status_path.read_text(encoding="utf-8"))
+                st = merge_status(raw)
+                init_st = st["initialize"].get("status")
+                LOG.info(
+                    "After %s: read %s — initialize.status=%r",
+                    label,
+                    status_path,
+                    init_st,
+                )
+                if init_st == "done":
+                    LOG.info("Spring bootstrap OK: initialize.status is done.")
+                    return True
+            except (json.JSONDecodeError, OSError) as e:
+                LOG.warning("Could not read/parse status after cursor-agent: %s", e)
+        else:
+            LOG.warning("Status file still missing after %s: %s", label, status_path)
+    LOG.error("Spring bootstrap failed after %s attempts.", max_attempts)
+    return False
+
+
+def run_migrate_slice(
     play_repo: Path,
     jar: Path,
     spring_repo: Path,
-    layer: str,
     batch_size: int | None,
     dry_run: bool,
+    *,
+    layer: str | None = None,
+    path_prefix: str | None = None,
 ) -> tuple[str, int, int, int]:
+    """Invoke ``migrate-app`` with optional semantic ``--layer`` and/or ``--path-prefix`` (app-relative)."""
     argv = [
         "java",
         "-jar",
         str(jar),
         "migrate-app",
-        "--layer",
-        layer,
         "--target",
         str(spring_repo),
     ]
+    if layer:
+        argv.extend(["--layer", layer])
+    if path_prefix is not None:
+        px = normalize_path_prefix(str(path_prefix))
+        if px:
+            argv.extend(["--path-prefix", px])
     if batch_size:
         argv.extend(["--batch-size", str(batch_size)])
     proc = run_cmd(argv, play_repo, dry_run)
@@ -666,17 +1357,25 @@ def migrate_until_done(
     play_repo: Path,
     jar: Path,
     spring_repo: Path,
-    layer: str,
     batch_size: int | None,
     dry_run: bool,
+    *,
+    layer: str | None = None,
+    path_prefix: str | None = None,
 ) -> tuple[int, int]:
     """Returns (total_files_processed, total_errors)."""
     total_n = 0
     total_m = 0
     prev_r = None
     while True:
-        _, n, m, r = run_migrate_layer(
-            play_repo, jar, spring_repo, layer, batch_size, dry_run
+        _, n, m, r = run_migrate_slice(
+            play_repo,
+            jar,
+            spring_repo,
+            batch_size,
+            dry_run,
+            layer=layer,
+            path_prefix=path_prefix,
         )
         total_n += n
         total_m += m
@@ -792,10 +1491,24 @@ def main() -> int:
         default=os.environ.get("CURSOR_MODEL")
         or os.environ.get("MIGRATION_CURSOR_MODEL")
         or None,
-        help=f"cursor-agent -m (default {DEFAULT_CURSOR_MODEL} or JSON).",
+        help=f"cursor-agent --model (default {DEFAULT_CURSOR_MODEL}; see Cursor CLI docs).",
     )
     parser.add_argument("--no-cursor", action="store_true")
+    parser.add_argument(
+        "--cursor-force",
+        action="store_true",
+        help=(
+            "Pass cursor-agent --force (non-interactive command approval). "
+            "Or set CURSOR_AGENT_FORCE=1."
+        ),
+    )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="DEBUG logging on stderr (also MIGRATION_VERBOSE=1).",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--skip-build-toolkit",
@@ -816,6 +1529,15 @@ def main() -> int:
     )
     parser.add_argument("--skip-inventory", action="store_true")
     parser.add_argument("--refresh-inventory", action="store_true")
+    parser.add_argument(
+        "--use-semantic-layers",
+        action="store_true",
+        help=(
+            "Legacy: migrate by semantic layer only (model→…→other) using migrate-app --layer. "
+            "Default: discover folder-based migration units under app/ and use --path-prefix. "
+            "Or set MIGRATION_USE_SEMANTIC_LAYERS=1."
+        ),
+    )
     parser.add_argument("--max-retries-per-layer", type=int, default=5)
     parser.add_argument("--max-total-llm-calls", type=int, default=50)
     parser.add_argument("--max-errors-llm", type=int, default=10)
@@ -824,6 +1546,12 @@ def main() -> int:
     parser.add_argument("--max-files-cursor-session", type=int, default=10)
 
     args = parser.parse_args()
+
+    configure_logging(
+        verbose=bool(args.verbose)
+        or os.environ.get("MIGRATION_VERBOSE", "").lower() in ("1", "true", "yes")
+    )
+    LOG.debug("migration_orchestrator starting (verbose=%s)", args.verbose)
 
     if not args.play_repo:
         print("ERROR: --play-repo (or PLAY_REPO) required.", file=sys.stderr)
@@ -857,33 +1585,69 @@ def main() -> int:
     else:
         spring_repo = resolve_spring_repo(play_repo, workspace_dir, args.spring_name)
 
+    spring_repo = spring_repo.resolve()
     status_path = resolve_status_path(spring_repo, args.status_file)
+    cursor_workspace = resolve_cursor_agent_workspace(play_repo, spring_repo, workspace_dir)
+    cursor_force = resolve_cursor_force(args)
+    LOG.info(
+        "cursor-agent shared workspace=%s (override with CURSOR_AGENT_WORKSPACE)",
+        cursor_workspace,
+    )
 
     if not status_path.is_file():
+        seed = merge_status({})
+        seed["current_step"] = "initialize"
+        atomic_write_json(status_path, seed)
         print(
-            f"ERROR: status file not found: {status_path}\n"
-            f"  Expected under Spring repo after builder/orchestrator creates it: {spring_repo}",
-            file=sys.stderr,
+            f"[orchestrator] Created default state file (initialize pending): {status_path}",
+            flush=True,
         )
-        return 1
 
     raw = json.loads(status_path.read_text(encoding="utf-8"))
     status = merge_status(raw)
 
+    use_cursor = not args.no_cursor and bool(os.environ.get("CURSOR_API_KEY"))
+    api_key = os.environ.get("CURSOR_API_KEY", "")
+
     if status["initialize"].get("status") != "done":
-        print(
-            "Initialize is not done. Run builder/agent to generate pom, Application, properties first.",
-            file=sys.stderr,
-        )
-        return 3
+        if use_cursor:
+            model_init = resolve_model(args, status)
+            gr_init = load_guardrails(args, status)
+            ok = bootstrap_initialize_via_cursor_agent(
+                play_repo=play_repo,
+                spring_repo=spring_repo,
+                cursor_workspace=cursor_workspace,
+                cursor_force=cursor_force,
+                status_path=status_path,
+                model=model_init,
+                api_key=api_key,
+                timeout_sec=gr_init.cursor_agent_timeout_sec,
+                dry_run=args.dry_run,
+            )
+            if not ok:
+                print(
+                    "ERROR: Spring project init did not finish (initialize.status still not done). "
+                    "Check cursor-agent output, CURSOR_API_KEY, and `cursor-agent` on PATH. "
+                    "You can still open Cursor IDE and run skill play-spring-orchestrator manually.",
+                    file=sys.stderr,
+                )
+                return 3
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            status = merge_status(raw)
+        else:
+            print(
+                "Initialize is not done: `migration-status.json` has initialize.status != done.\n"
+                "  Export CURSOR_API_KEY so this script can spawn `cursor-agent` for Spring init (builder Step 1), "
+                "or open Cursor and run play-spring-orchestrator (see setup.sh next steps), then re-run.",
+                file=sys.stderr,
+            )
+            return 3
 
     jar = abs_path(args.jar) if args.jar else (play_repo / "dev-toolkit-1.0.0.jar")
     if not jar.is_file():
         print(f"ERROR: JAR not found: {jar}", file=sys.stderr)
         return 1
 
-    use_cursor = not args.no_cursor and bool(os.environ.get("CURSOR_API_KEY"))
-    api_key = os.environ.get("CURSOR_API_KEY", "")
     model = resolve_model(args, status)
     status["autonomous"]["cursor_model"] = model
     gr = load_guardrails(args, status)
@@ -893,47 +1657,105 @@ def main() -> int:
     mig_dir = spring_repo / ".migration"
     mig_dir.mkdir(parents=True, exist_ok=True)
 
-    # Source inventory
-    if not args.skip_inventory and (
-        args.refresh_inventory
-        or not status.get("source_inventory")
-        or not status["source_inventory"].get("captured_at")
-    ):
-        status["source_inventory"] = scan_play_java(play_repo)
-        atomic_write_json(status_path, status)
+    ws_data = parse_workspace_yaml(workspace_dir / "workspace.yaml")
+    semantic_mode = use_semantic_layer_mode(args)
+
+    # Source inventory + migration units (path-based slices under app/)
+    if not args.skip_inventory:
+        inv_changed = False
+        if (
+            args.refresh_inventory
+            or not status.get("source_inventory")
+            or not status["source_inventory"].get("captured_at")
+        ):
+            status["source_inventory"] = scan_play_java(play_repo)
+            inv_changed = True
+        if not semantic_mode:
+            if (
+                args.refresh_inventory
+                or not status.get("migration_units")
+                or len(status.get("migration_units") or []) == 0
+            ):
+                disc = discover_migration_units(
+                    play_repo,
+                    migration_unit_root=ws_data.get("migration_unit_root"),
+                )
+                status["migration_units"] = merge_discovered_migration_units(
+                    status.get("migration_units"),
+                    disc,
+                )
+                inv_changed = True
+        if inv_changed:
+            status = merge_status(status)
+            atomic_write_json(status_path, status)
+
+    if not semantic_mode and args.skip_inventory:
+        if not status.get("migration_units") or len(status.get("migration_units") or []) == 0:
+            disc = discover_migration_units(
+                play_repo,
+                migration_unit_root=ws_data.get("migration_unit_root"),
+            )
+            status["migration_units"] = merge_discovered_migration_units(
+                status.get("migration_units"),
+                disc,
+            )
+            status = merge_status(status)
+            atomic_write_json(status_path, status)
 
     status["current_step"] = "transform_validate"
-    layer_start_time: dict[str, float] = {}
+    entity_start_time: dict[str, float] = {}
 
     try:
-        for layer in LAYER_ORDER:
-            le = status["layers"][layer]
+        if semantic_mode:
+            entity_iterable: list[tuple[str, dict[str, Any], str | None, str | None]] = [
+                (lyr, status["layers"][lyr], lyr, None) for lyr in LAYER_ORDER
+            ]
+        else:
+            entity_iterable = []
+            for i, u in enumerate(status.get("migration_units") or []):
+                if not isinstance(u, dict):
+                    continue
+                uid = str(u.get("id") or f"unit_{i}")
+                px = u.get("path_prefix")
+                path_px = "" if px is None else str(px)
+                entity_iterable.append((uid, u, None, path_px))
+
+        for label, le, layer_arg, path_prefix_arg in entity_iterable:
             if le.get("status") == "done":
                 continue
 
-            if layer not in layer_start_time:
-                layer_start_time[layer] = time.monotonic()
+            if label not in entity_start_time:
+                entity_start_time[label] = time.monotonic()
 
             # Transform
             le["status"] = "in_progress"
             atomic_write_json(status_path, status)
 
             n_add, m_err = migrate_until_done(
-                play_repo, jar, spring_repo, layer, args.batch_size, args.dry_run
+                play_repo,
+                jar,
+                spring_repo,
+                args.batch_size,
+                args.dry_run,
+                layer=layer_arg,
+                path_prefix=path_prefix_arg,
             )
             le["files_migrated"] = int(le.get("files_migrated", 0)) + n_add
             if m_err:
-                print(f"[warn] migrate-app reported {m_err} errors for layer {layer}", file=sys.stderr)
+                print(
+                    f"[warn] migrate-app reported {m_err} errors for slice {label}",
+                    file=sys.stderr,
+                )
 
             # Compile / fix loop
             while True:
-                elapsed_mins = (time.monotonic() - layer_start_time[layer]) / 60.0
+                elapsed_mins = (time.monotonic() - entity_start_time[label]) / 60.0
                 if elapsed_mins > gr.timeout_layer_mins:
                     le["status"] = "timeout"
                     le["failure_reason"] = "timeout"
                     status["failed_layers"].append(
                         {
-                            "layer": layer,
+                            "layer": label,
                             "reason": "timeout",
                             "last_errors_summary": None,
                         }
@@ -972,7 +1794,7 @@ def main() -> int:
                     le["failure_reason"] = "loop_detected"
                     status["failed_layers"].append(
                         {
-                            "layer": layer,
+                            "layer": label,
                             "reason": "loop_detected",
                             "last_errors_summary": norm[:20],
                             "errors_history_tail": hist[-2:] if len(hist) >= 2 else hist,
@@ -1003,7 +1825,7 @@ def main() -> int:
                     le["status"] = "budget_exhausted"
                     le["failure_reason"] = "budget_exhausted"
                     status["failed_layers"].append(
-                        {"layer": layer, "reason": "budget_exhausted"}
+                        {"layer": label, "reason": "budget_exhausted"}
                     )
                     atomic_write_json(status_path, status)
                     return 4
@@ -1013,7 +1835,7 @@ def main() -> int:
                     le["failure_reason"] = "max_retries"
                     status["failed_layers"].append(
                         {
-                            "layer": layer,
+                            "layer": label,
                             "reason": "max_retries",
                             "last_errors_summary": norm[:20],
                         }
@@ -1025,7 +1847,7 @@ def main() -> int:
 
                 if use_cursor:
                     le["status"] = "fixing"
-                    err_path = mig_dir / f"errors-{layer}.json"
+                    err_path = mig_dir / f"errors-{label}.json"
                     err_path.write_text(json.dumps(errors, indent=2), encoding="utf-8")
                     status["autonomous"]["last_errors_path"] = str(err_path)
                     atomic_write_json(status_path, status)
@@ -1038,7 +1860,13 @@ def main() -> int:
 
                     for batch in batches:
                         top = batch[: gr.max_errors_llm]
-                        prompt = f"""Fix Spring Boot compilation errors for layer "{layer}".
+                        slice_hint = ""
+                        if path_prefix_arg is not None:
+                            slice_hint = (
+                                f'\nPlay ``app/`` path prefix for this slice: '
+                                f'"{path_prefix_arg or "(whole app)"}"'
+                            )
+                        prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
 Errors (JSON, top {len(top)}):
 {json.dumps(top, indent=2)}
 
@@ -1047,7 +1875,9 @@ Rules:
 - Do not change public method signatures unless required to compile.
 - Touch at most {gr.max_files_per_fix} files in this attempt.
 - Only edit files under the Spring project; preserve business logic.
+- Cursor workspace root (Play + Spring visible): {cursor_workspace}
 - Spring repo root: {spring_repo}
+- Play repo (read originals if needed): {play_repo}
 """
                         proc = call_cursor_agent(
                             model,
@@ -1055,9 +1885,16 @@ Rules:
                             api_key,
                             gr.cursor_agent_timeout_sec,
                             args.dry_run,
+                            workspace=cursor_workspace,
+                            cwd=cursor_workspace,
+                            force=cursor_force,
+                            run_label=f"compile-fix slice={label}",
                         )
                         if proc.returncode != 0:
-                            print(proc.stderr or proc.stdout, file=sys.stderr)
+                            LOG.warning(
+                                "compile-fix cursor-agent failed rc=%s (see streamed lines above)",
+                                proc.returncode,
+                            )
                         le["llm_calls"] = int(le.get("llm_calls", 0)) + 1
                         status["autonomous"]["total_llm_calls"] = int(
                             status["autonomous"]["total_llm_calls"]
@@ -1078,7 +1915,10 @@ Rules:
         # Final compile check
         code, _ = run_mvn_compile(spring_repo, args.dry_run)
         if code != 0:
-            print("WARNING: final mvn compile failed after all layers.", file=sys.stderr)
+            print(
+                "WARNING: final mvn compile failed after all migration slices.",
+                file=sys.stderr,
+            )
 
         status["current_step"] = "verify"
         status["migration_verification"] = run_verification(status, play_repo, spring_repo)
