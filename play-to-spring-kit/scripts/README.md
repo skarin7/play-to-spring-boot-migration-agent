@@ -1,6 +1,6 @@
 # Migration orchestrator (`migration_orchestrator.py`)
 
-Python **stdlib-only** driver for the Play → Spring pipeline: `dev-toolkit` **`migrate-app`** per layer, **`mvn compile`**, optional **`cursor-agent`** for compile fixes, **`source_inventory`** / **`migration_verification`** counts.
+Python **stdlib-only** driver for the Play → Spring pipeline: `dev-toolkit` **`migrate-app`** per **migration unit** (folder slices under `app/` via **`--path-prefix`**, discovered automatically) or, in legacy mode, per **semantic layer** (`--layer`), then **`mvn compile`**, optional **`cursor-agent`** for compile fixes, **`source_inventory`** / **`migration_verification`** counts.
 
 **State:** a single **`migration-status.json`** (no `pipeline_state.json`). Default path is **`<spring-repo>/migration-status.json`**, where **`spring-repo`** is resolved after **workspace preparation** (see below). Override with `--status-file` or `MIGRATION_STATUS_FILE`.
 
@@ -26,7 +26,7 @@ With **`--skip-build-toolkit`**, you must already have a **`*.jar`** in **`play-
 1. Create a **Cursor User API Key** (dashboard → Integrations → User API Keys, `sk_...`).
 2. `export CURSOR_API_KEY="sk_..."`
 
-**Model** (`cursor-agent -m`):
+**Model** (`cursor-agent --model`; see [Cursor CLI parameters](https://cursor.com/docs/cli/reference/parameters)):
 
 | Precedence | Source |
 |------------|--------|
@@ -40,10 +40,24 @@ Confirm slugs with `cursor-agent --help` for your CLI version.
 **Headless agent** (what the script runs):
 
 ```bash
-cursor-agent -p -m composer-2 --output-format json --api-key "$CURSOR_API_KEY" "<prompt>"
+cursor-agent -p --output-format json --api-key "$CURSOR_API_KEY" --model composer-2 "<prompt>"
 ```
 
 Optional: `CURSOR_AGENT_TIMEOUT_SEC` (default **1800**) per agent invocation.
+
+## Logging & real-time `cursor-agent` progress
+
+All orchestrator logs go to **stderr** with timestamps (`HH:MM:SS LEVEL [migration] …`).
+
+- **`cursor-agent` stdout** → logged as **`INFO [cursor-agent stdout] …`** (line by line as it arrives).
+- **`cursor-agent` stderr** → logged as **`WARNING [cursor-agent stderr] …`**.
+- If the agent runs longer than **30s** without exiting, an **`INFO`** heartbeat explains it is still running (pid + elapsed time).
+
+Use **`-v`** / **`--verbose`** or **`MIGRATION_VERBOSE=1`** for **DEBUG** (includes redacted argv dump).
+
+```bash
+MIGRATION_VERBOSE=1 python3 scripts/migration_orchestrator.py --play-repo ../my-play-app
+```
 
 ## Environment variables
 
@@ -54,17 +68,21 @@ Optional: `CURSOR_AGENT_TIMEOUT_SEC` (default **1800**) per agent invocation.
 | `SPRING_REPO` | Optional explicit Spring root (skips `workspace.yaml` / `spring-<basename>` resolution) |
 | `MIGRATION_STATUS_FILE` | Explicit status file path if set (only when `--status-file` is omitted) |
 | `CURSOR_API_KEY` | Required for `cursor-agent` (omit with `--no-cursor`) |
+| `MIGRATION_VERBOSE` | Set to `1` / `true` / `yes` for DEBUG logging (same idea as `-v`) |
 | `CURSOR_MODEL` / `MIGRATION_CURSOR_MODEL` | Model slug |
 | `MAX_RETRIES_PER_LAYER` | Default 5 |
 | `MAX_TOTAL_LLM_CALLS` | Default 50 (whole run) |
 | `MAX_ERRORS_TO_SEND_LLM` | Default 10 (per prompt) |
 | `MAX_FILES_PER_FIX` | Default 3 (prompt instruction only) |
-| `TIMEOUT_PER_LAYER_MINS` | Default 30 (wall clock per layer) |
+| `TIMEOUT_PER_LAYER_MINS` | Default 30 (wall clock per layer / per migration slice) |
 | `MAX_FILES_PER_CURSOR_SESSION` | Default 10 (batch errors by file) |
+| `MIGRATION_USE_SEMANTIC_LAYERS` | Set to `1` / `true` / `yes` for legacy **six-layer** `migrate-app --layer` loop (same as CLI `--use-semantic-layers`) |
 
 ## Paths (after workspace preparation)
 
 Preparation writes **`workspace.yaml`** under the **workspace** directory (default: **parent of the play repo**) with absolute **`spring_repo`** and **`play_repo`**.
+
+Optional key (read by the orchestrator, not required for `setup.sh` to write it): **`migration_unit_root`** — path relative to Play **`app/`** that forces the **split parent** when auto-discovery is wrong (same semantics as choosing that folder’s immediate subdirs as units).
 
 The orchestrator then resolves:
 
@@ -119,7 +137,18 @@ Common flags:
 - `--skip-build-toolkit` — skip **`mvn package`**; require a **`*.jar`** in **`play-to-spring-kit/lib/`**
 - `--toolkit-root DIR` — **`java-dev-toolkit`** Maven project path (default: sibling of the kit; see **`JAVA_DEV_TOOLKIT_ROOT`**)
 - `--skip-inventory` — do not scan Play `app/` for `source_inventory`
-- `--refresh-inventory` — recompute `source_inventory` even if present
+- `--refresh-inventory` — recompute `source_inventory` and **rediscover** `migration_units` even if present
+- `--use-semantic-layers` — legacy: loop **model → … → other** using `migrate-app --layer` only (no path-prefix slicing)
+
+## Migration units (default)
+
+By default the orchestrator discovers **folder-based units** under Play **`app/`**:
+
+1. Prefer a directory **`P`** that has a child named **`controllers`** or **`controller`**; units are **`P`’s immediate subdirectories** (each becomes a `path_prefix` relative to `app/`). If **`P`** itself contains loose `*.java` files, **`P`** is also a unit.
+2. Else descend narrow chains until a directory has **≥ 3** subdirectories, then use each subdirectory (with Java) as a unit.
+3. Else a single unit for the whole **`app/`** (`path_prefix` empty).
+
+Each unit runs **`migrate-app --path-prefix <prefix>`** (no `--layer` unless you use semantic mode). Per-file transform semantics stay **`LayerDetector`** inside the JAR.
 
 ## Init gate
 
@@ -134,11 +163,11 @@ If `initialize.status` in JSON is not **`done`**, the script exits **3** and **d
 | 2 | Stuck compile with `--no-cursor` (error count not decreasing for 3 runs) |
 | 3 | Initialize not done |
 | 4 | `budget_exhausted` (`total_llm_calls` ≥ max) |
-| 5 | `--fail-fast` stopped on layer failure |
+| 5 | `--fail-fast` stopped on slice / layer failure |
 
 ## Resuming
 
-Re-run the same command. Layers with `status: done` are skipped. State is written after major steps (atomic replace).
+Re-run the same command. Slices in **`migration_units`** (or layers in legacy mode) with `status: done` are skipped. State is written after major steps (atomic replace).
 
 ## Overnight run
 
@@ -158,7 +187,7 @@ Ignore generated diagnostics:
 .migration/
 ```
 
-The script writes `errors-<layer>.json` under `<spring-repo>/.migration/`.
+The script writes `errors-<slice-id>.json` (or legacy `errors-<layer>.json`) under `<spring-repo>/.migration/`.
 
 ## `migration-status.json` extensions
 
@@ -168,9 +197,12 @@ The script merges backward-compatible fields:
 - **Per-layer** (in addition to existing keys): `retry_count`, `llm_calls`, `errors_history`, `failure_reason`, optional `compile_error_counts` (no-cursor stuck detection)
 - **`failed_layers`**: append-only summary entries on terminal failure
 - **`source_inventory`**: Play `app/**/*.java` counts by layer (LayerDetector rules)
-- **`migration_verification`**: after all layers processed, Spring vs Play file counts
+- **`migration_units`**: ordered list of `{ id, path_prefix, java_file_count, status, … }` for folder-based runs (`null` in legacy semantic-layer-only mode)
+- **`migration_verification`**: after all slices / layers processed, Spring vs Play file counts
 
-Layer order: **model → repository → manager → service → controller → other**.
+Legacy **semantic** layer order (only with `--use-semantic-layers`): **model → repository → manager → service → controller → other**.
+
+**`dev-toolkit migrate-app`:** optional **`--path-prefix`** (repeat or comma-separated) scopes sources under `app/`; combine with **`--layer`** only if you need both filters.
 
 ## Session resume (`cursor-agent`)
 

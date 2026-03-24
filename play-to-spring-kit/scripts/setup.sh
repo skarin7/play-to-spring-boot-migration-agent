@@ -3,7 +3,7 @@
 # Usage: scripts/setup.sh <path-to-play-repo> [--workspace <dir>] [--spring-name <name>]
 #
 # Example (from kit root): ./scripts/setup.sh /path/to/your-play-repo
-#   -> Creates spring-<basename>/ (sibling), workspace.yaml, <play-repo>/.cursor/{config,docs,skills} (Cursor-native layout).
+#   -> Creates spring-<basename>/ (sibling), workspace.yaml, <play-repo>/.cursor/{config,docs,settings.json,skills} (Cursor-native layout).
 #
 # Example: ./scripts/setup.sh /path/to/your-play-repo --workspace /tmp/migrate --spring-name my-spring-app
 #   -> Uses /tmp/migrate as workspace; Spring project at /tmp/migrate/my-spring-app
@@ -90,7 +90,7 @@ detect_base_package() {
 BASE_PACKAGE=$(detect_base_package "$PLAY_REPO/app" 2>/dev/null || echo "com.example.application")
 echo "Base package:  $BASE_PACKAGE"
 
-# Cursor uses <play-repo>/.cursor/ — keep everything there: skills/ (Agent) + config/ + docs/ reference.
+# Cursor uses <play-repo>/.cursor/ — keep everything there: skills/ (Agent) + settings.json + config/ + docs/ reference.
 # Do not copy raw kit skills/*.md into .cursor/skills/; those paths are reserved for play-spring-*/SKILL.md below.
 KIT_DEST="${PLAY_REPO}/.cursor"
 echo "Installing kit reference under $KIT_DEST (config/, docs/)"
@@ -188,13 +188,21 @@ for skill_md in "$KIT_ROOT/skills"/*.md; do
   echo "  $name"
 done
 
+# Copy Cursor workspace settings (e.g. agent.autoRun) alongside .cursor/skills/
+if [[ -f "$KIT_ROOT/settings.json" ]]; then
+  cp "$KIT_ROOT/settings.json" "$KIT_DEST/settings.json"
+  echo "Installed $KIT_DEST/settings.json (from kit)"
+else
+  echo "Note: no $KIT_ROOT/settings.json (optional)"
+fi
+
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "  Workspace:       $WORKSPACE_DIR"
 echo "  Play repo:      $PLAY_REPO"
 echo "  Spring project: $SPRING_REPO"
-echo "  Cursor / kit:     $KIT_DEST (skills/ + config/ + docs/)"
+echo "  Cursor / kit:     $KIT_DEST (skills/ + settings.json + config/ + docs/)"
 echo "  Agent state:    $SPRING_REPO/migration-status.json (created by orchestrator)"
 echo ""
 echo "Cursor Agent skills: $PLAY_REPO/.cursor/skills/"
@@ -205,8 +213,9 @@ if [[ -d "$KIT_ROOT/lib" ]] && [[ -n "$(find "$KIT_ROOT/lib" -maxdepth 1 -name '
 fi
 echo ""
 echo "Next steps:"
-echo "  1. Open $WORKSPACE_DIR (or $PLAY_REPO) in Cursor so Agent sees .cursor/skills/"
-echo "  2. Autonomous run: Cursor Agent + skill play-spring-orchestrator + one-liner (see docs/play_to_spring_migration.md §2.1)."
-echo "  3. Manual CLI only: cd $PLAY_REPO && java -jar dev-toolkit-1.0.0.jar migrate-app"
+echo "  1. Headless: export CURSOR_API_KEY; run migration_orchestrator.py --play-repo $PLAY_REPO"
+echo "     (creates migration-status.json if needed, runs cursor-agent for Spring init, then migrate-app loop)."
+echo "  2. IDE: Open $WORKSPACE_DIR (or $PLAY_REPO) → Agent → skill play-spring-orchestrator (see docs/play_to_spring_migration.md §2.1)."
+echo "  3. Manual CLI: cd $PLAY_REPO && java -jar dev-toolkit-1.0.0.jar migrate-app"
 echo "  4. Spring build: cd $SPRING_REPO && mvn compile"
 echo ""

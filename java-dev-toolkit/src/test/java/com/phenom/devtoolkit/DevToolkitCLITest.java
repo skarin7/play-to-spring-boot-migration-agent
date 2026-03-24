@@ -6,6 +6,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 import static org.junit.Assert.*;
 
@@ -99,6 +100,41 @@ public class DevToolkitCLITest {
         });
 
         assertEquals(0, code);
+    }
+
+    @Test
+    public void pathPrefix_normalizeAndMatch() {
+        assertEquals("com/foo", DevToolkitCLI.MigrateAppCommand.normalizeSinglePathPrefix("/com/foo/"));
+        assertTrue(DevToolkitCLI.MigrateAppCommand.matchesPathPrefix("com/foo/Bar.java", "com/foo"));
+        assertFalse(DevToolkitCLI.MigrateAppCommand.matchesPathPrefix("com/food/Bar.java", "com/foo"));
+        assertTrue(DevToolkitCLI.MigrateAppCommand.matchesPathPrefix("com/foo", "com/foo"));
+        assertEquals(
+                Arrays.asList("a", "b"),
+                DevToolkitCLI.MigrateAppCommand.normalizePathPrefixes(Arrays.asList("a/,./b"))
+        );
+    }
+
+    @Test
+    public void execute_migrateApp_pathPrefix_filtersAppOnly() throws Exception {
+        Path playRoot = tempFolder.getRoot().toPath().resolve("play");
+        Path springRoot = tempFolder.getRoot().toPath().resolve("spring");
+        Path pkgA = playRoot.resolve("app/com/example/pkgA");
+        Path pkgB = playRoot.resolve("app/com/example/pkgB");
+        Files.createDirectories(pkgA);
+        Files.createDirectories(pkgB);
+        Files.write(pkgA.resolve("A.java"), "public class A {}".getBytes());
+        Files.write(pkgB.resolve("B.java"), "public class B {}".getBytes());
+
+        int code = DevToolkitCLI.execute(new String[]{
+                "migrate-app",
+                "--source", playRoot.toAbsolutePath().toString(),
+                "--target", springRoot.toAbsolutePath().toString(),
+                "--path-prefix", "com/example/pkgA"
+        });
+
+        assertEquals(0, code);
+        assertTrue(Files.exists(springRoot.resolve("src/main/java/com/example/pkgA/A.java")));
+        assertFalse(Files.exists(springRoot.resolve("src/main/java/com/example/pkgB/B.java")));
     }
 
     @Test

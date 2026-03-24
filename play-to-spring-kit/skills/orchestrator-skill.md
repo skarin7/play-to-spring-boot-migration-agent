@@ -7,10 +7,10 @@ description: Run the full migration: Transform (CLI) then Validation (compile + 
 
 ## Goal
 
-You are the **orchestrator agent**. Run the full Play-to-Spring migration in three steps, processing files **per-layer in dependency order** and tracking progress in `migration-status.json`.
+You are the **orchestrator agent**. Run the full Play-to-Spring migration in three steps and track progress in `migration-status.json`.
 
 1. **Initialize** the Spring project (pom.xml, Application.java, application.properties).
-2. **Transform + Validate per layer** — for each layer, transform files via CLI then compile and fix until clean before moving to the next layer.
+2. **Transform + Validate per migration slice** — default is **folder-based units** under Play `app/` (`migration_units` in JSON, `migrate-app --path-prefix`). Legacy mode uses **semantic layers** only (`migrate-app --layer`, six fixed buckets). For each slice or layer: transform via CLI, then compile and fix until clean before moving on.
 
 Setup has already created the Spring directory structure and copied `dev-toolkit-1.0.0.jar` to the Play repo root.
 
@@ -51,6 +51,13 @@ Also set **`total_java_files`** = sum of all `*.java` under `app/` (or your Play
 
 See **Builder skill** for example commands and the **post-migration verification** step.
 
+### Migration units (default — `migration_orchestrator.py` and modern runs)
+
+- **`migration_units`**: array of objects, one per folder slice, e.g. `{ "id": "com_example_services", "path_prefix": "com/example/services", "java_file_count": 42, "status": "pending", ... }` (same per-slice fields as layers: `files_migrated`, `validate_iteration`, `errors_history`, …).
+- Discovery (orchestrator): prefer parent **`P`** of a **`controllers`/`controller`** child; units = **`P`’s immediate subdirs** (plus **`P`** itself if it has loose `*.java`). Fallback: branch with ≥3 subdirs. Last resort: one unit for all of `app/` (`path_prefix` `""`).
+- **`migrate-app`**: `java -jar dev-toolkit-1.0.0.jar migrate-app --path-prefix <rel-to-app> [--batch-size N]` (optional `--layer` to further filter by semantic layer).
+- Legacy: **`--use-semantic-layers`** or **`MIGRATION_USE_SEMANTIC_LAYERS=1`** — use only the six **`layers`** below and **`--layer`**, no path-prefix loop.
+
 ### Full schema (illustrative)
 
 ```json
@@ -76,6 +83,18 @@ See **Builder skill** for example commands and the **post-migration verification
       "other": 0
     }
   },
+  "migration_units": [
+    {
+      "id": "com_example_controllers",
+      "path_prefix": "com/example/controllers",
+      "java_file_count": 0,
+      "status": "pending",
+      "files_migrated": 0,
+      "files_failed": [],
+      "validate_iteration": 0,
+      "last_error_count": null
+    }
+  ],
   "layers": {
     "model":      { "status": "pending | in_progress | done", "files_migrated": 0, "files_failed": [], "validate_iteration": 0, "last_error_count": null },
     "repository": { "status": "pending", "files_migrated": 0, "files_failed": [], "validate_iteration": 0, "last_error_count": null },
@@ -104,8 +123,8 @@ See **Builder skill** for example commands and the **post-migration verification
 ### Resumability
 
 1. Read `<spring-repo>/migration-status.json` on start.
-2. Skip steps/layers already marked `"done"`.
-3. Resume from the first incomplete layer.
+2. Skip slices in **`migration_units`** (or **`layers`** in legacy mode) already marked `"done"`.
+3. Resume from the first incomplete slice or layer.
 4. If `current_step` is **`verify`**, run the **migration verification** step (Builder skill) before setting `done`.
 
 ## Order of execution
@@ -118,32 +137,31 @@ Generate `pom.xml`, `Application.java`, and `application.properties` by reading 
 
 **After:** Update `migration-status.json` → `initialize.status = "done"`, `current_step = "transform_validate"`, and populate **`source_inventory`** (see state tracking above).
 
-### Step 2 — Transform + Validate per layer
+### Step 2 — Transform + Validate per slice (or per layer in legacy mode)
 
-Process layers in dependency order: **model → repository → manager → service → controller → other**.
+**Default (folder units):** Process each entry in **`migration_units`** in order (orchestrator sorts by `path_prefix`). For each unit:
 
-For each layer:
+#### 2a. Transform the slice
 
-#### 2a. Transform the layer
+**Skip if** this unit's `status = "done"`.
 
-**Skip if** this layer's `status = "done"`.
+```bash
+java -jar dev-toolkit-1.0.0.jar migrate-app --path-prefix <path-relative-to-app>
+```
+
+Use **`--target`** if the Spring repo is not the default. Omit **`--path-prefix`** only for the single whole-`app/` unit (`path_prefix` empty). The JAR still classifies each file with **`LayerDetector`** for transform behavior.
+
+Optional: combine **`--layer`** with **`--path-prefix`** if you need an extra semantic filter.
+
+If there are too many files, use **`--batch-size`**. Repeat until CLI reports **`remaining` = 0**. Record **`files_migrated`** / **`files_failed`**.
+
+**Legacy (semantic layers only):** same as before — process **`model → repository → manager → service → controller → other`** with:
 
 ```bash
 java -jar dev-toolkit-1.0.0.jar migrate-app --layer <layer>
 ```
 
-This transforms **all** files in the layer. The CLI skips files that already exist in the target (idempotent). If there are too many files, use `--batch-size`:
-
-```bash
-java -jar dev-toolkit-1.0.0.jar migrate-app --layer <layer> --batch-size 15
-```
-
-Parse CLI output for file count and errors: `"migrate-app done: N files, M errors, R remaining"`.
-
-- If `R remaining > 0`, run the command again to process the next batch.
-- Record `files_migrated` and `files_failed` in status.
-
-#### 2b. Validate the layer
+#### 2b. Validate the slice / layer
 
 ```bash
 cd ../spring-<basename> && mvn compile
@@ -158,18 +176,18 @@ cd ../spring-<basename> && mvn compile
 3. **Stuck detection:** If `last_error_count` hasn't decreased for 3 consecutive iterations, escalate to the user.
 4. Repeat until `mvn compile` exits 0.
 
-**After:** Update layer `status = "done"` in `migration-status.json`. Move to the next layer.
+**After:** Update this unit’s (or layer’s) `status = "done"` in `migration-status.json`. Move to the next entry.
 
 #### When to use `--batch-size`
 
-- **Small layer (< 20 files):** Transform all at once (`--layer X` without `--batch-size`), validate, done.
-- **Large layer (20+ files):** If the first full transform produces many compile errors (> 20), consider re-running subsequent layers with `--batch-size 15` to keep errors manageable. The CLI skips already-migrated files, so this is safe.
+- **Small slice (< 20 files):** Transform without `--batch-size`, validate, done.
+- **Large slice:** Use `--batch-size 15` (or orchestrator default) so compile-fix iterations stay manageable. The CLI skips already-migrated files, so this is safe.
 
-### Step 3 — Migration verification (after all layers compile)
+### Step 3 — Migration verification (after all slices / layers compile)
 
 **Skip if** `migration_verification.status` is already `passed` and you are not forcing a re-check.
 
-After **every layer** is `done` and **`mvn compile`** is green for the full project:
+After **every** **`migration_units`** entry (or **every layer** in legacy mode) is `done` and **`mvn compile`** is green for the full project:
 
 1. Set `current_step` to **`verify`**.
 2. Follow **Builder skill → Step 3: Migration completeness verification**:
@@ -195,10 +213,10 @@ After verification, merge into `migration-status.json` (do not wipe earlier fiel
 | Step | Action |
 |------|--------|
 | 1 | Initialize: read `build.sbt` + `application.conf` → generate `pom.xml`, `Application.java`, `application.properties`. Record **`source_inventory`** from Play `app/**/*.java`. |
-| 2 | For each layer (model → repository → manager → service → controller → other): transform with `migrate-app --layer X`, then `mvn compile` + fix until clean. |
+| 2 | **Default:** For each **`migration_units`** entry: `migrate-app --path-prefix …`, then `mvn compile` + fix until clean. **Legacy:** For each semantic layer, `migrate-app --layer …`, then compile + fix. |
 | 3 | **Verify migration completeness** against `source_inventory`; update **`migration_verification`**; then mark **`done`**. |
 
-## Layer order and rationale
+## Legacy semantic layer order ( `--use-semantic-layers` only )
 
 | Order | Layer | Why |
 |-------|-------|-----|
@@ -208,6 +226,8 @@ After verification, merge into `migration-status.json` (do not wipe earlier fiel
 | 4 | service | Depends on models, repositories, managers. |
 | 5 | controller | Depends on services, managers, models. |
 | 6 | other | Config, utilities, anything not classified above. |
+
+Folder-based units do not enforce this global order; compile order follows **`path_prefix`** sort. Prefer fixing **`pom.xml`** and shared deps early if the first slices fail for missing dependencies.
 
 ## Halt conditions
 
