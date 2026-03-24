@@ -15,7 +15,7 @@ chmod +x start_upgrade.sh   # once per clone
 ./start_upgrade.sh --play-repo /path/to/your-play-app
 ```
 
-[`start_upgrade.sh`](start_upgrade.sh) runs the orchestrator with a **dedicated venv** at **`play-to-spring-kit/.venv`**: it creates that directory on first use, then **`pip install -r play-to-spring-kit/scripts/requirements-venv.txt`** (includes optional **`pyhocon`** for **`--export-play-conf`**). No system **`--break-system-packages`** is required. Set **`MIGRATION_SKIP_VENV_SYNC=1`** to skip the pip step (reuse an already-provisioned `.venv`). All orchestrator flags (e.g. **`--help`**, **`--skip-build-toolkit`**, **`--workspace`**) pass through unchanged.
+[`start_upgrade.sh`](start_upgrade.sh) runs the orchestrator with a **dedicated venv** at **`play-to-spring-kit/.venv`**: it creates that directory on first use, then **`pip install -r play-to-spring-kit/scripts/requirements-venv.txt`** (includes optional **`pyhocon`** for **`--export-play-conf`**). No system **`--break-system-packages`** is required. Set **`MIGRATION_SKIP_VENV_SYNC=1`** to skip the pip step (reuse an already-provisioned `.venv`). It also picks **JDK 17+** when **`JAVA_HOME`** is unset or is Java 8 (**`jenv`** 17 or macOS **`java_home`**), warns if **`CURSOR_API_KEY`** is missing (headless init), and if **`MIGRATION_WORKSPACE`** is set and you omit **`--workspace`**, prepends **`--workspace`** (after **`mkdir -p`**). Use **`PLAY_REPO`** when you omit **`--play-repo`** on the CLI. All other orchestrator flags pass through unchanged.
 
 **Equivalent (system Python):** from **`play-to-spring-kit/`**:
 
@@ -24,6 +24,8 @@ python3 scripts/migration_orchestrator.py --play-repo /path/to/your-play-app
 ```
 
 For **`--export-play-conf`** without **`start_upgrade.sh`**, use a venv or install **`pyhocon`** yourself (see kit **[scripts/README.md](play-to-spring-kit/scripts/README.md)**).
+
+**Example (cms-tenant + isolated workspace):** `export CURSOR_API_KEY=…`, `export PLAY_REPO=$HOME/Work/CodeBase/CMS/cms-tenant-service`, `export MIGRATION_WORKSPACE=$HOME/Work/CodeBase/cms-tenant-migration-ws`, then **`./start_upgrade.sh`** (or add flags like **`--export-play-conf`**).
 
 You do **not** need to `cd` into **`scripts/`**; run the wrapper from the repo root or invoke the Python file with a path as above. **`migration-status.json`** must already have **`initialize.status: done`** in the Spring project before the transform/compile loop runs; until then the orchestrator exits with code **3** (see the kit scripts README).
 

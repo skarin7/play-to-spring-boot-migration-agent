@@ -36,7 +36,7 @@ commands block on approval. Set ``CURSOR_AGENT_WORKSPACE`` to an absolute path t
 ``--workspace`` for unusual layouts.
 
 Exit codes: 0 OK, 1 unexpected error, 2 stuck compile (no cursor), 3 init not done,
-            4 budget exhausted, 5 fail-fast failure.
+            4 budget exhausted, 5 fail-fast failure or blocking infrastructure_error (JDK/Lombok).
 """
 
 from __future__ import annotations
@@ -64,6 +64,13 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 DEFAULT_CURSOR_MODEL = "composer-2"
+# Used for early compile-fix rounds only when --optimise-compile-fix / MIGRATION_OPTIMISE_COMPILE_FIX.
+CURSOR_MODEL_FIX_WHEN_OPTIMISED = "cursor-small"
+
+MVN_PACKAGE_MISSING_RE = re.compile(
+    r"package\s+([\w.]+)\s+does\s+not\s+exist",
+    re.IGNORECASE,
+)
 
 LOG = logging.getLogger("migration_orchestrator")
 
@@ -485,6 +492,18 @@ LAYER_ORDER = (
     "other",
 )
 
+# Slice statuses that must not be treated as a successful migration (avoid current_step=done).
+_SLICE_TERMINAL_FAILURE_STATUSES: frozenset[str] = frozenset(
+    (
+        "loop_detected",
+        "failed",
+        "timeout",
+        "budget_exhausted",
+        "needs_manual_fix",
+        "no_migrated_output",
+    )
+)
+
 MIGRATE_DONE_RE = re.compile(
     r"migrate-app done:\s*(\d+)\s*files,\s*(\d+)\s*errors,\s*(\d+)\s*remaining",
     re.IGNORECASE,
@@ -821,6 +840,48 @@ def merge_discovered_migration_units(
     return sorted(out, key=lambda u: (u.get("path_prefix") or ""))
 
 
+def reset_transform_progress_after_bootstrap(status: dict[str, Any]) -> None:
+    """
+    After initialize completes in this run, clear stale ``done`` flags on slices/layers.
+
+    Otherwise ``merge_discovered_migration_units`` keeps old ``status: done`` and the
+    orchestrator skips all ``migrate-app`` work (looks like it stopped after bootstrap).
+    """
+    status["current_step"] = "transform_validate"
+    status["failed_layers"] = []
+    status["migration_verification"] = None
+    auto = status.setdefault("autonomous", {})
+    auto["total_llm_calls"] = 0
+    auto["last_errors_path"] = None
+
+    for u in status.get("migration_units") or []:
+        if not isinstance(u, dict):
+            continue
+        u["status"] = "pending"
+        u["retry_count"] = 0
+        u["llm_calls"] = 0
+        u["errors_history"] = []
+        u["files_migrated"] = 0
+        u["files_failed"] = []
+        u["validate_iteration"] = 0
+        u["last_error_count"] = None
+        u["failure_reason"] = None
+        u.pop("compile_error_counts", None)
+
+    for lyr in LAYER_ORDER:
+        le = status["layers"][lyr]
+        le["status"] = "pending"
+        le["retry_count"] = 0
+        le["llm_calls"] = 0
+        le["errors_history"] = []
+        le["files_migrated"] = 0
+        le["files_failed"] = []
+        le["validate_iteration"] = 0
+        le["last_error_count"] = None
+        le["failure_reason"] = None
+        le.pop("compile_error_counts", None)
+
+
 def default_layer_entry() -> dict[str, Any]:
     return {
         "status": "pending",
@@ -840,6 +901,9 @@ def default_autonomous() -> dict[str, Any]:
         "total_llm_calls": 0,
         "max_total_llm_calls": int(os.environ.get("MAX_TOTAL_LLM_CALLS", "50")),
         "cursor_model": DEFAULT_CURSOR_MODEL,
+        "cursor_model_fix": DEFAULT_CURSOR_MODEL,
+        "cursor_model_escalate": DEFAULT_CURSOR_MODEL,
+        "escalate_after_retries": int(os.environ.get("ESCALATE_AFTER_RETRIES", "2")),
         "max_files_per_cursor_session": int(
             os.environ.get("MAX_FILES_PER_CURSOR_SESSION", "10")
         ),
@@ -937,6 +1001,146 @@ def normalize_errors(errors: list[dict[str, Any]]) -> list[str]:
     return sorted(sigs)
 
 
+def error_signature(e: dict[str, Any]) -> str:
+    fp = e.get("file", "")
+    line = e.get("line", 0)
+    msg = (e.get("message") or "").strip()
+    return f"{fp}:{line}:{msg}"
+
+
+def classify_compile_errors(
+    errors: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Split Maven-style errors into infrastructure / missing-dependency / code buckets.
+
+    Infrastructure: compiler plugin crashed (Lombok/JDK, etc.) — not fixable by editing .java alone.
+    Missing dependency: ``package X does not exist`` for known third-party prefixes.
+    Code: everything else (and unknown package missing).
+    """
+    infra: list[dict[str, Any]] = []
+    dep: list[dict[str, Any]] = []
+    code: list[dict[str, Any]] = []
+    for e in errors:
+        fp = str(e.get("file", "") or "")
+        msg = (e.get("message") or "").strip()
+        low = msg.lower()
+        if (
+            "fatal error compiling" in low
+            or "exceptionininitializererror" in low
+            or ("typetag" in low and "unknown" in low)
+        ) and (fp == "unknown" or not fp.endswith(".java")):
+            infra.append(e)
+            continue
+        m = MVN_PACKAGE_MISSING_RE.search(msg)
+        if m:
+            pkg = m.group(1).strip()
+            if pkg.startswith(
+                (
+                    "javax.inject",
+                    "javax.annotation",
+                    "jakarta.annotation",
+                    "org.neo4j.driver.v1",
+                    "com.google.common",
+                    "play.",
+                )
+            ):
+                dep.append(e)
+            else:
+                code.append(e)
+            continue
+        code.append(e)
+    return infra, dep, code
+
+
+# package prefix -> (groupId, artifactId, version or "" to omit version — BOM manages it)
+_KNOWN_DEP_BY_PACKAGE_PREFIX: list[tuple[str, str, str, str]] = [
+    ("com.google.common", "com.google.guava", "guava", "33.3.1-jre"),
+    ("javax.inject", "javax.inject", "javax.inject", "1"),
+    ("javax.annotation", "jakarta.annotation", "jakarta.annotation-api", ""),
+    ("org.neo4j.driver.v1", "org.neo4j.driver", "neo4j-java-driver", ""),
+]
+
+
+def _pom_declares_dependency(text: str, group_id: str, artifact_id: str) -> bool:
+    """Heuristic: same artifactId appears near groupId in pom (handles multi-module)."""
+    if f"<artifactId>{artifact_id}</artifactId>" not in text:
+        return False
+    i = 0
+    while True:
+        j = text.find(f"<artifactId>{artifact_id}</artifactId>", i)
+        if j < 0:
+            return False
+        window = text[max(0, j - 400) : j + 80]
+        if f"<groupId>{group_id}</groupId>" in window:
+            return True
+        i = j + 1
+
+
+def _dependency_xml_block(group_id: str, artifact_id: str, version: str) -> str:
+    ver_line = (
+        f"\n            <version>{version}</version>"
+        if version
+        else ""
+    )
+    return f"""
+        <dependency>
+            <groupId>{group_id}</groupId>
+            <artifactId>{artifact_id}</artifactId>{ver_line}
+        </dependency>"""
+
+
+def try_deterministic_pom_fix(
+    spring_repo: Path,
+    dep_errors: list[dict[str, Any]],
+    dry_run: bool,
+) -> int:
+    """
+    Add known Maven coordinates for missing-package errors. Returns count of deps added.
+    """
+    if not dep_errors or dry_run:
+        return 0
+    pom = spring_repo / "pom.xml"
+    if not pom.is_file():
+        return 0
+    text = pom.read_text(encoding="utf-8", errors="replace")
+    needed: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for e in dep_errors:
+        m = MVN_PACKAGE_MISSING_RE.search((e.get("message") or ""))
+        if not m:
+            continue
+        pkg = m.group(1).strip()
+        for prefix, gid, aid, ver in _KNOWN_DEP_BY_PACKAGE_PREFIX:
+            if pkg == prefix or pkg.startswith(prefix + "."):
+                key = (gid, aid)
+                if key not in seen:
+                    seen.add(key)
+                    needed.append((gid, aid, ver))
+                break
+    blocks: list[str] = []
+    for gid, aid, ver in needed:
+        if _pom_declares_dependency(text, gid, aid):
+            continue
+        blocks.append(_dependency_xml_block(gid, aid, ver))
+        LOG.info(
+            "try_deterministic_pom_fix: will add dependency %s:%s%s",
+            gid,
+            aid,
+            f":{ver}" if ver else " (no explicit version)",
+        )
+    if not blocks:
+        return 0
+    close = "</dependencies>"
+    idx = text.find(close)
+    if idx < 0:
+        LOG.warning("try_deterministic_pom_fix: no %s in pom.xml", close)
+        return 0
+    new_text = text[:idx] + "".join(blocks) + "\n    " + text[idx:]
+    pom.write_text(new_text, encoding="utf-8")
+    return len(blocks)
+
+
 def is_looping(current: list[str], history: list[list[str]]) -> bool:
     if len(history) < 1:
         return False
@@ -944,7 +1148,15 @@ def is_looping(current: list[str], history: list[list[str]]) -> bool:
         return True
     if len(history) >= 2 and current == history[-2]:
         return True
-    if len(history) >= 1 and len(current) > len(history[-1]) + 2:
+    prev_n = len(history[-1])
+    cur_n = len(current)
+    if prev_n == 0:
+        return False
+    # Progress: strictly fewer errors than last round — not a loop spike.
+    if cur_n < prev_n:
+        return False
+    spike_threshold = max(int(prev_n * 1.5 + 0.999), prev_n + 5)
+    if cur_n > spike_threshold:
         return True
     return False
 
@@ -960,6 +1172,43 @@ def resolve_model(args: argparse.Namespace, status: dict[str, Any]) -> str:
     if m:
         return str(m)
     return DEFAULT_CURSOR_MODEL
+
+
+def optimise_compile_fix_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "optimise_compile_fix", False):
+        return True
+    return os.environ.get("MIGRATION_OPTIMISE_COMPILE_FIX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def resolve_fix_model(args: argparse.Namespace, status: dict[str, Any]) -> str:
+    if getattr(args, "cursor_model_fix", None):
+        return args.cursor_model_fix
+    v = os.environ.get("CURSOR_MODEL_FIX") or os.environ.get("MIGRATION_CURSOR_MODEL_FIX")
+    if v:
+        return v.strip()
+    if optimise_compile_fix_enabled(args):
+        return CURSOR_MODEL_FIX_WHEN_OPTIMISED
+    # Default: same model as main (legacy behavior before two-tier optimisation).
+    return resolve_model(args, status)
+
+
+def resolve_escalate_model(args: argparse.Namespace, status: dict[str, Any]) -> str:
+    """Premium model after cheap fix attempts; defaults to main cursor model."""
+    if getattr(args, "cursor_model_escalate", None):
+        return args.cursor_model_escalate
+    v = os.environ.get("CURSOR_MODEL_ESCALATE") or os.environ.get(
+        "MIGRATION_CURSOR_MODEL_ESCALATE"
+    )
+    if v:
+        return v.strip()
+    m = status.get("autonomous", {}).get("cursor_model_escalate")
+    if m:
+        return str(m)
+    return resolve_model(args, status)
 
 
 def resolve_cursor_force(args: argparse.Namespace) -> bool:
@@ -982,6 +1231,9 @@ class Guardrails:
     timeout_layer_mins: int = 30
     max_files_per_cursor_session: int = 10
     cursor_agent_timeout_sec: int = 1800
+    fix_model: str = DEFAULT_CURSOR_MODEL
+    escalate_model: str = DEFAULT_CURSOR_MODEL
+    escalate_after_retries: int = 2
 
 
 def load_guardrails(args: argparse.Namespace, status: dict[str, Any]) -> Guardrails:
@@ -1016,6 +1268,19 @@ def load_guardrails(args: argparse.Namespace, status: dict[str, Any]) -> Guardra
         ),
         cursor_agent_timeout_sec=int(
             os.environ.get("CURSOR_AGENT_TIMEOUT_SEC", "1800")
+        ),
+        fix_model=resolve_fix_model(args, status),
+        escalate_model=resolve_escalate_model(args, status),
+        escalate_after_retries=int(
+            auto.get(
+                "escalate_after_retries",
+                int(
+                    os.environ.get(
+                        "ESCALATE_AFTER_RETRIES",
+                        str(getattr(args, "escalate_after_retries", 2)),
+                    )
+                ),
+            )
         ),
     )
 
@@ -1409,6 +1674,74 @@ def run_migrate_slice(
     return out, n, m, r
 
 
+def expected_play_java_for_slice(
+    semantic_mode: bool,
+    label: str,
+    le: dict[str, Any],
+    status: dict[str, Any],
+) -> int:
+    """How many Java files Play should contribute for this slice (from inventory or unit metadata)."""
+    if semantic_mode:
+        return int(
+            (status.get("source_inventory") or {})
+            .get("by_layer", {})
+            .get(label, 0)
+            or 0
+        )
+    return int(le.get("java_file_count", 0) or 0)
+
+
+def migration_output_plausible(
+    *,
+    dry_run: bool,
+    semantic_mode: bool,
+    label: str,
+    le: dict[str, Any],
+    status: dict[str, Any],
+    spring_repo: Path,
+    n_add: int,
+) -> tuple[bool, str]:
+    """
+    True if we should allow marking the slice done when ``mvn compile`` succeeds.
+
+    Otherwise an empty Spring scaffold (e.g. only ``Application.java``) compiles while
+    ``migrate-app`` wrote 0 files — a common false ``done``.
+    """
+    if dry_run:
+        return True, ""
+    exp = expected_play_java_for_slice(semantic_mode, label, le, status)
+    if exp <= 0:
+        return True, ""
+    cumulative = int(le.get("files_migrated", 0) or 0)
+    if n_add > 0 or cumulative > 0:
+        return True, ""
+    total_sp, by_sp = scan_spring_java(spring_repo)
+    if semantic_mode:
+        got = int(by_sp.get(label, 0) or 0)
+        slack = max(2, min(6, exp // 4))
+        if got >= max(1, exp - slack):
+            return True, ""
+        return (
+            False,
+            f"Play inventory expects ~{exp} Java files in layer {label!r}, but migrate-app "
+            f"wrote 0 this round (files_migrated still 0) and Spring has {got} main/java files "
+            f"in that layer — compile succeeded on an empty/partial tree. "
+            f"dev-toolkit skips outputs that already exist; check wrong --layer, or delete stale "
+            f"Spring sources to force re-migration.",
+        )
+    inv = status.get("source_inventory") or {}
+    inv_total = int(inv.get("total_java_files") or 0)
+    return (
+        False,
+        f"path unit {label!r} expects ~{exp} Java files under Play app/, but migrate-app wrote 0 "
+        f"this round and files_migrated is still 0 (Spring main/java has {total_sp} files; "
+        f"inventory total_java_files={inv_total}). "
+        f"Compile can succeed with only the bootstrap app class. "
+        f"Check slice not skipped as done, path-prefix mismatch, or migrate-app skipping because "
+        f"target paths already exist. If outputs are stale, remove them under src/main/java and re-run.",
+    )
+
+
 def migrate_until_done(
     play_repo: Path,
     jar: Path,
@@ -1549,6 +1882,44 @@ def main() -> int:
         or None,
         help=f"cursor-agent --model (default {DEFAULT_CURSOR_MODEL}; see Cursor CLI docs).",
     )
+    parser.add_argument(
+        "--optimise-compile-fix",
+        "-O",
+        action="store_true",
+        help=(
+            f"Two-tier compile-fix: first rounds use {CURSOR_MODEL_FIX_WHEN_OPTIMISED}, "
+            f"then escalate to --cursor-model (default {DEFAULT_CURSOR_MODEL}). "
+            "Without this flag, all compile-fix rounds use the main model only. "
+            "Or set MIGRATION_OPTIMISE_COMPILE_FIX=1."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-model-fix",
+        default=os.environ.get("CURSOR_MODEL_FIX")
+        or os.environ.get("MIGRATION_CURSOR_MODEL_FIX")
+        or None,
+        help=(
+            "Override compile-fix \"cheap\" model (implies you want a non-default first-pass model; "
+            f"default without --optimise-compile-fix is same as --cursor-model). "
+            "Env: CURSOR_MODEL_FIX."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-model-escalate",
+        default=os.environ.get("CURSOR_MODEL_ESCALATE")
+        or os.environ.get("MIGRATION_CURSOR_MODEL_ESCALATE")
+        or None,
+        help=(
+            "cursor-agent model after escalate-after-retries failed rounds "
+            "(default: same as --cursor-model)."
+        ),
+    )
+    parser.add_argument(
+        "--escalate-after-retries",
+        type=int,
+        default=int(os.environ.get("ESCALATE_AFTER_RETRIES", "2")),
+        help="Switch to escalate model after this many unsuccessful fix rounds (default 2).",
+    )
     parser.add_argument("--no-cursor", action="store_true")
     parser.add_argument(
         "--cursor-force",
@@ -1585,6 +1956,17 @@ def main() -> int:
     )
     parser.add_argument("--skip-inventory", action="store_true")
     parser.add_argument("--refresh-inventory", action="store_true")
+    parser.add_argument(
+        "--reset-migration-progress",
+        action="store_true",
+        help=(
+            "Reset every layer and migration_unit to pending, clear failed_layers and "
+            "migration_verification, and zero autonomous LLM counters so the transform "
+            "phase runs again without re-running Spring bootstrap. "
+            "Use when slices show loop_detected or status looks stuck after bootstrap. "
+            "Or set MIGRATION_RESET_PROGRESS=1."
+        ),
+    )
     parser.add_argument(
         "--use-semantic-layers",
         action="store_true",
@@ -1691,8 +2073,21 @@ def main() -> int:
     raw = json.loads(status_path.read_text(encoding="utf-8"))
     status = merge_status(raw)
 
+    reset_progress = bool(getattr(args, "reset_migration_progress", False)) or (
+        os.environ.get("MIGRATION_RESET_PROGRESS", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+    if reset_progress:
+        LOG.info(
+            "Resetting slice/layer progress (--reset-migration-progress / MIGRATION_RESET_PROGRESS)."
+        )
+        reset_transform_progress_after_bootstrap(status)
+        status = merge_status(status)
+        atomic_write_json(status_path, status)
+
     use_cursor = not args.no_cursor and bool(os.environ.get("CURSOR_API_KEY"))
     api_key = os.environ.get("CURSOR_API_KEY", "")
+    bootstrap_just_ran = False
 
     if status["initialize"].get("status") != "done":
         if use_cursor:
@@ -1717,6 +2112,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 3
+            bootstrap_just_ran = not args.dry_run
             raw = json.loads(status_path.read_text(encoding="utf-8"))
             status = merge_status(raw)
         else:
@@ -1738,6 +2134,9 @@ def main() -> int:
     gr = load_guardrails(args, status)
     status["autonomous"]["max_total_llm_calls"] = gr.max_total_llm_calls
     status["autonomous"]["max_files_per_cursor_session"] = gr.max_files_per_cursor_session
+    status["autonomous"]["cursor_model_fix"] = gr.fix_model
+    status["autonomous"]["cursor_model_escalate"] = gr.escalate_model
+    status["autonomous"]["escalate_after_retries"] = gr.escalate_after_retries
 
     mig_dir = spring_repo / ".migration"
     mig_dir.mkdir(parents=True, exist_ok=True)
@@ -1787,6 +2186,15 @@ def main() -> int:
             status = merge_status(status)
             atomic_write_json(status_path, status)
 
+    if bootstrap_just_ran:
+        LOG.info(
+            "Initialize finished this run — resetting migration slice/layer progress so "
+            "migrate-app runs (previous migration-status.json had slices marked done)."
+        )
+        reset_transform_progress_after_bootstrap(status)
+        status = merge_status(status)
+        atomic_write_json(status_path, status)
+
     status["current_step"] = "transform_validate"
     entity_start_time: dict[str, float] = {}
 
@@ -1804,6 +2212,29 @@ def main() -> int:
                 px = u.get("path_prefix")
                 path_px = "" if px is None else str(px)
                 entity_iterable.append((uid, u, None, path_px))
+
+        mode_label = "semantic_layers" if semantic_mode else "path_units"
+        preview = [x[0] for x in entity_iterable[:16]]
+        more = " …" if len(entity_iterable) > 16 else ""
+        LOG.info(
+            "Transform phase: mode=%s, slice_count=%d%s%s",
+            mode_label,
+            len(entity_iterable),
+            (", slices=" + ", ".join(preview)) if preview else "",
+            more,
+        )
+        if not entity_iterable:
+            LOG.error(
+                "No migration slices to run: path mode has empty migration_units after inventory "
+                "(or semantic mode has no layers). Use --refresh-inventory, avoid --skip-inventory "
+                "unless units exist, or check Play app/ layout / workspace.yaml migration_unit_root."
+            )
+            status["current_step"] = "transform_validate"
+            atomic_write_json(status_path, merge_status(status))
+            return 6
+
+        # Signatures from prior slices that ended loop_detected / max_retries — omit from LLM prompts.
+        excluded_error_signatures: set[str] = set()
 
         for label, le, layer_arg, path_prefix_arg in entity_iterable:
             if le.get("status") == "done":
@@ -1859,6 +2290,30 @@ def main() -> int:
                 le["last_error_count"] = err_count
 
                 if code == 0:
+                    plausible, mig_reason = migration_output_plausible(
+                        dry_run=args.dry_run,
+                        semantic_mode=semantic_mode,
+                        label=label,
+                        le=le,
+                        status=status,
+                        spring_repo=spring_repo,
+                        n_add=n_add,
+                    )
+                    if not plausible:
+                        le["status"] = "no_migrated_output"
+                        le["failure_reason"] = "no_migrated_output"
+                        LOG.error("Slice %r: %s", label, mig_reason)
+                        status["failed_layers"].append(
+                            {
+                                "layer": label,
+                                "reason": "no_migrated_output",
+                                "last_errors_summary": [mig_reason[:500]],
+                            }
+                        )
+                        atomic_write_json(status_path, status)
+                        if args.fail_fast:
+                            return 5
+                        break
                     le["status"] = "done"
                     le["failure_reason"] = None
                     le["errors_history"] = []
@@ -1871,12 +2326,43 @@ def main() -> int:
                     # fallback: one blob
                     errors = [{"file": "unknown", "line": 0, "message": log[-4000:]}]
 
+                infra, dep, code_e = classify_compile_errors(errors)
+                if infra and not dep and not code_e:
+                    le["status"] = "needs_manual_fix"
+                    le["failure_reason"] = "infrastructure_error"
+                    LOG.error(
+                        "Slice %r: compiler/toolchain failure (e.g. Lombok vs JDK). "
+                        "Fix pom.xml (lombok.version / maven-compiler-plugin) or JDK — not fixable by editing app Java.",
+                        label,
+                    )
+                    status["failed_layers"].append(
+                        {
+                            "layer": label,
+                            "reason": "infrastructure_error",
+                            "last_errors_summary": normalize_errors(infra)[:20],
+                        }
+                    )
+                    atomic_write_json(status_path, status)
+                    break
+                if infra and (dep or code_e):
+                    LOG.warning(
+                        "Slice %r: mixed toolchain + source errors; infrastructure lines omitted from LLM prompt.",
+                        label,
+                    )
+
+                pom_added = try_deterministic_pom_fix(spring_repo, dep, args.dry_run)
+                if pom_added > 0:
+                    atomic_write_json(status_path, status)
+                    continue
+
                 norm = normalize_errors(errors)
                 hist: list[list[str]] = list(le.get("errors_history") or [])
 
                 if is_looping(norm, hist):
                     le["status"] = "loop_detected"
                     le["failure_reason"] = "loop_detected"
+                    for sig in norm:
+                        excluded_error_signatures.add(sig)
                     status["failed_layers"].append(
                         {
                             "layer": label,
@@ -1918,6 +2404,8 @@ def main() -> int:
                 if int(le.get("retry_count", 0)) >= gr.max_retries_per_layer:
                     le["status"] = "failed"
                     le["failure_reason"] = "max_retries"
+                    for sig in norm:
+                        excluded_error_signatures.add(sig)
                     status["failed_layers"].append(
                         {
                             "layer": label,
@@ -1930,18 +2418,43 @@ def main() -> int:
                         return 5
                     break
 
+                llm_errors: list[dict[str, Any]] = []
+                for e in code_e + dep:
+                    if error_signature(e) in excluded_error_signatures:
+                        continue
+                    llm_errors.append(e)
+                if not llm_errors:
+                    llm_errors = [e for e in errors if e not in infra]
+                if not llm_errors:
+                    llm_errors = errors[: gr.max_errors_llm]
+
+                dep_hint = ""
+                if dep:
+                    dep_hint = (
+                        "\nSome errors are missing third-party packages — prefer adding the correct "
+                        "Maven dependency in pom.xml when the package is an external library "
+                        "(e.g. Guava, Neo4j driver).\n"
+                    )
+
                 if use_cursor:
                     le["status"] = "fixing"
                     err_path = mig_dir / f"errors-{label}.json"
-                    err_path.write_text(json.dumps(errors, indent=2), encoding="utf-8")
+                    err_path.write_text(json.dumps(llm_errors, indent=2), encoding="utf-8")
                     status["autonomous"]["last_errors_path"] = str(err_path)
                     atomic_write_json(status_path, status)
 
                     batches = build_error_batches(
-                        errors, gr.max_files_per_cursor_session
+                        llm_errors, gr.max_files_per_cursor_session
                     )
                     if not batches:
-                        batches = [errors[: gr.max_errors_llm]]
+                        batches = [llm_errors[: gr.max_errors_llm]]
+
+                    fix_round = int(le.get("retry_count", 0))
+                    attempt_model = (
+                        gr.escalate_model
+                        if fix_round >= gr.escalate_after_retries
+                        else gr.fix_model
+                    )
 
                     for batch in batches:
                         top = batch[: gr.max_errors_llm]
@@ -1954,7 +2467,7 @@ def main() -> int:
                         prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
 Errors (JSON, top {len(top)}):
 {json.dumps(top, indent=2)}
-
+{dep_hint}
 Rules:
 - Fix one error category at a time where possible.
 - Do not change public method signatures unless required to compile.
@@ -1965,7 +2478,7 @@ Rules:
 - Play repo (read originals if needed): {play_repo}
 """
                         proc = call_cursor_agent(
-                            model,
+                            attempt_model,
                             prompt,
                             api_key,
                             gr.cursor_agent_timeout_sec,
@@ -1973,7 +2486,9 @@ Rules:
                             workspace=cursor_workspace,
                             cwd=cursor_workspace,
                             force=cursor_force,
-                            run_label=f"compile-fix slice={label}",
+                            run_label=(
+                                f"compile-fix slice={label} model={attempt_model}"
+                            ),
                         )
                         if proc.returncode != 0:
                             LOG.warning(
@@ -1997,6 +2512,14 @@ Rules:
                     atomic_write_json(status_path, status)
                 # loop: compile again
 
+            if le.get("failure_reason") == "infrastructure_error":
+                LOG.error(
+                    "Halting migration: slice %r has infrastructure_error (fix JDK / Lombok / compiler plugin).",
+                    label,
+                )
+                atomic_write_json(status_path, status)
+                return 5
+
         # Final compile check
         code, _ = run_mvn_compile(spring_repo, args.dry_run)
         if code != 0:
@@ -2007,8 +2530,48 @@ Rules:
 
         status["current_step"] = "verify"
         status["migration_verification"] = run_verification(status, play_repo, spring_repo)
+
+        slice_failures: list[str] = []
+        if semantic_mode:
+            for lyr in LAYER_ORDER:
+                st = str(status["layers"][lyr].get("status") or "")
+                if st in _SLICE_TERMINAL_FAILURE_STATUSES:
+                    slice_failures.append(f"{lyr}={st}")
+        else:
+            for i, u in enumerate(status.get("migration_units") or []):
+                if not isinstance(u, dict):
+                    continue
+                st = str(u.get("status") or "")
+                if st in _SLICE_TERMINAL_FAILURE_STATUSES:
+                    slice_failures.append(f"{u.get('id')}={st}")
+            stale_lyr = [
+                f"{lyr}={status['layers'][lyr].get('status')}"
+                for lyr in LAYER_ORDER
+                if str(status["layers"][lyr].get("status") or "")
+                in _SLICE_TERMINAL_FAILURE_STATUSES
+            ]
+            if stale_lyr:
+                LOG.warning(
+                    "Path-based mode only uses migration_units; layers.* still show prior "
+                    "semantic-run state (%s). Ignore or run with --reset-migration-progress to clear.",
+                    "; ".join(stale_lyr[:12]) + (" …" if len(stale_lyr) > 12 else ""),
+                )
+
+        if slice_failures:
+            status["current_step"] = "needs_attention"
+            LOG.error(
+                "One or more slices ended in a failure state: %s. "
+                "current_step set to needs_attention (not done). "
+                "Fix JDK/Lombok/pom or sources, then re-run; use --reset-migration-progress to "
+                "clear pending/loop state after fixes.",
+                "; ".join(slice_failures[:40])
+                + (" …" if len(slice_failures) > 40 else ""),
+            )
+            atomic_write_json(status_path, merge_status(status))
+            return 5
+
         status["current_step"] = "done"
-        atomic_write_json(status_path, status)
+        atomic_write_json(status_path, merge_status(status))
 
     except subprocess.TimeoutExpired:
         print("ERROR: subprocess timed out.", file=sys.stderr)
