@@ -3,19 +3,26 @@ package com.phenom.devtoolkit;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.CastExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.EnclosedExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.InstanceOfExpr;
+import com.github.javaparser.ast.expr.MarkerAnnotationExpr;
+import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.ast.ImportDeclaration;
 
 import java.util.ArrayList;
@@ -75,6 +82,10 @@ final class SpringCompileFixups {
         }
         if (layer == LayerDetector.Layer.CONTROLLER && rewriteResponseEntityOkStringLiteral(cu, clazz, result)) {
             // uses objectMapper.valueToTree
+        }
+        if (rewriteAutowiredRequiredFalseConstructorParamsToOptional(cu, clazz, result)) {
+            ensureImport(cu, "java.util.Optional");
+            ensureImport(cu, "org.springframework.beans.factory.annotation.Autowired");
         }
     }
 
@@ -352,5 +363,80 @@ final class SpringCompileFixups {
         if (!already) {
             cu.addImport(new ImportDeclaration(fqcn, false, false));
         }
+    }
+
+    /**
+     * {@code @Autowired(required=false)} on a constructor parameter does not mean “optional dependency” in Spring
+     * (unlike fields/setters). Rewrite to {@code Optional<T>} and ensure the constructor has {@code @Autowired}.
+     */
+    private static boolean rewriteAutowiredRequiredFalseConstructorParamsToOptional(
+            CompilationUnit cu,
+            ClassOrInterfaceDeclaration clazz,
+            PlayToSpringTransformer.TransformResult result) {
+        boolean any = false;
+        for (ConstructorDeclaration cd : clazz.getConstructors()) {
+            boolean touched = false;
+            for (Parameter param : cd.getParameters()) {
+                List<AnnotationExpr> toStrip = new ArrayList<>();
+                for (AnnotationExpr ann : param.getAnnotations()) {
+                    if (isAutowiredRequiredFalse(ann)) {
+                        toStrip.add(ann);
+                    }
+                }
+                if (toStrip.isEmpty()) {
+                    continue;
+                }
+                for (AnnotationExpr ann : toStrip) {
+                    param.getAnnotations().remove(ann);
+                }
+                if (!isTypeAlreadyJavaUtilOptional(param.getType())) {
+                    Type inner = param.getType().clone();
+                    ClassOrInterfaceType opt = new ClassOrInterfaceType(null, "Optional");
+                    opt.setTypeArguments(new NodeList<>(inner));
+                    param.setType(opt);
+                }
+                touched = true;
+                any = true;
+            }
+            if (touched && !constructorHasAutowiredAnnotation(cd)) {
+                cd.addAnnotation(new MarkerAnnotationExpr("Autowired"));
+            }
+        }
+        if (any) {
+            result.appliedChanges.add(
+                    "Constructor @Autowired(required=false) on param → Optional<…> (Spring Framework injection semantics)");
+        }
+        return any;
+    }
+
+    private static boolean constructorHasAutowiredAnnotation(ConstructorDeclaration cd) {
+        return cd.getAnnotations().stream().anyMatch(SpringCompileFixups::isAutowiredAnnotationName);
+    }
+
+    private static boolean isAutowiredAnnotationName(AnnotationExpr a) {
+        String n = a.getNameAsString();
+        return "Autowired".equals(n) || n.endsWith(".Autowired");
+    }
+
+    private static boolean isAutowiredRequiredFalse(AnnotationExpr ann) {
+        if (!isAutowiredAnnotationName(ann) || !(ann instanceof NormalAnnotationExpr)) {
+            return false;
+        }
+        for (MemberValuePair pair : ((NormalAnnotationExpr) ann).getPairs()) {
+            if ("required".equals(pair.getNameAsString())
+                    && pair.getValue().isBooleanLiteralExpr()
+                    && !pair.getValue().asBooleanLiteralExpr().getValue()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isTypeAlreadyJavaUtilOptional(Type t) {
+        if (!(t instanceof ClassOrInterfaceType)) {
+            return false;
+        }
+        ClassOrInterfaceType c = (ClassOrInterfaceType) t;
+        return "Optional".equals(c.getNameAsString()) && c.getTypeArguments().isPresent();
     }
 }
