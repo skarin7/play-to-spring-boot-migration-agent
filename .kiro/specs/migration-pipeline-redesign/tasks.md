@@ -183,10 +183,10 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - _Requirements: 9.1, 9.2, 9.3_
 
   - [ ] 8.5 Add cross-module full-compile verification pass
+    - Note: `atomic_write_json()` (write to `.tmp` then rename) already exists on-disk; `migration_output_plausible()` guard also already present — do not duplicate
     - After all units in a run are `"done"`, run `IncrementalCompiler(spring_repo).compile()` (no `changed_files`) as a full cross-module validation pass
     - Feed any errors back into the deterministic-first loop for the affected unit
     - Set `current_step = "verify"` then `"done"` only after this pass succeeds
-    - Write `migration-status.json` atomically (write to `.tmp` then rename) after each unit transitions to `"done"`
     - _Requirements: 9.5, 9.6, 10.4_
 
   - [ ] 8.6 Call `migrate_v1_to_v2` at orchestrator startup
@@ -223,3 +223,4 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation before wiring the next layer
 - The Java toolkit must be rebuilt (`mvn package -DskipTests` in `java-dev-toolkit/`) after task 1 before Python integration tests can run end-to-end
+- **On-disk state (as of last review):** `migration_orchestrator.py` already contains `migration_output_plausible()`, `expected_play_java_for_slice()`, `atomic_write_json()`, and `no_migrated_output` in `_SLICE_TERMINAL_FAILURE_STATUSES` — these are newer additions not in the original pasted snapshot; do not re-implement them in tasks 8.x
