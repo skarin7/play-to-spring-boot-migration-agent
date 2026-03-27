@@ -108,7 +108,8 @@ sequenceDiagram
         O->>O: skip
     else pending
         O->>CA: bootstrap prompt (system_prompt + step1_only, ~800 tokens total)
-        CA->>FS: write pom.xml, Application.java, application.properties
+        CA->>FS: read pom.xml (scaffold already present from start.spring.io)
+        CA->>FS: add project deps from build.sbt, append application.properties
         CA->>FS: mvn compile (empty app)
         CA-->>O: initialize.status = done
     end
@@ -119,16 +120,16 @@ sequenceDiagram
 
 ## Components and Interfaces
 
-### Component 1: ExtendedFixups (Java — new AST rules in SpringCompileFixups)
+### Component 1: ExtendedFixups (Java — AST fixups for common Play→Spring patterns)
 
-**Purpose**: Extend the existing `SpringCompileFixups.apply()` with additional deterministic AST
-rewrites that currently fall through to the LLM. Target: cover the "Still manual" items from
-`docs/compile-fixes-for-toolkit.md` plus the runtime wiring patterns.
+**Purpose**: Add deterministic AST rewrites to `SpringCompileFixups.apply()` for Play→Spring
+patterns that currently require LLM intervention. Target: cover the common injection and
+annotation patterns documented in `docs/compile-fixes-for-toolkit.md`.
 
-**New rules to add**:
+**Rules to implement**:
 
 ```java
-// New entry points in SpringCompileFixups.apply():
+// Entry points to add to SpringCompileFixups.apply():
 rewriteJavaxInjectProviderToObjectProvider(cu, result);   // javax.inject.Provider<T> → ObjectProvider<T>
 rewriteProviderGetToGetObject(cu, result);                // provider.get() → provider.getObject()
 rewriteJavaxSingletonToComponent(cu, clazz, result);     // @Singleton on non-controller → @Component
@@ -136,10 +137,10 @@ rewriteSendPostSyncAmbiguity(cu, result);                 // disambiguate Map vs
 rewriteHttpServletRequestAtServiceBoundary(cu, result);  // play.mvc.Http.Request in service params
 ```
 
-**Interface** (additions to existing class):
+**Interface**:
 
 ```java
-// All follow the existing pattern: static boolean rewriteXxx(CompilationUnit, TransformResult)
+// Each method follows the static boolean rewriteXxx(CompilationUnit, TransformResult) pattern
 static boolean rewriteJavaxInjectProviderToObjectProvider(CompilationUnit cu, TransformResult result);
 static boolean rewriteProviderGetToGetObject(CompilationUnit cu, TransformResult result);
 static boolean rewriteJavaxSingletonToComponent(CompilationUnit cu, ClassOrInterfaceDeclaration clazz, TransformResult result);
@@ -306,13 +307,14 @@ The LLM reads less boilerplate and gets to the actionable rules faster.
 IF initialize.status == done → SKIP
 
 STEPS:
-1. Read build.sbt → map deps → write pom.xml (spring-boot-starter-parent 3.x, Java 17)
-2. Read conf/application.conf → write application.properties
-3. Write Application.java at <base_package>/Application.java (@SpringBootApplication)
-4. mvn -q compile → fix until clean
-5. Set initialize.status = done in migration-status.json
+1. Check pom.xml already exists (scaffold from start.spring.io — do NOT regenerate)
+2. Read build.sbt → add project-specific deps to existing <dependencies> block
+3. Read conf/application.conf → append project keys to application.properties
+4. Verify Application.java package matches base_package from workspace.yaml
+5. mvn -q compile → fix until clean
+6. Set initialize.status = done in migration-status.json
 
-FORBIDDEN: migrate-app, Step 2/3 loops, reading orchestrator skill
+FORBIDDEN: regenerate pom.xml from scratch, migrate-app, Step 2/3 loops
 ```
 
 
@@ -328,15 +330,15 @@ Each has a deterministic fix that does not require LLM reasoning.
 | E01 | `cannot find symbol.*class ObjectMapper` | Missing Jackson import | Add `import com.fasterxml.jackson.databind.ObjectMapper;` | Python fixer |
 | E02 | `cannot find symbol.*class JsonNode` | Missing Jackson import | Add `import com.fasterxml.jackson.databind.JsonNode;` | Python fixer |
 | E03 | `package play\.\w+ does not exist` | Play import not removed | Remove matching import line | Python fixer |
-| E04 | `cannot find symbol.*method ok\(` | `Results.ok()` remnant | Rewrite to `ResponseEntity.ok(...)` | JAR (existing partial) + Python fixer |
-| E05 | `incompatible types.*Result.*ResponseEntity` | Return type not updated | Change method return type to `ResponseEntity<JsonNode>` | JAR (existing partial) + Python fixer |
-| E06 | `package javax\.inject does not exist` | javax → jakarta migration | Replace `javax.inject` → `jakarta.inject` in imports | JAR (existing) |
-| E07 | `cannot find symbol.*class Provider` | `javax.inject.Provider` not rewritten | Replace with `ObjectProvider<T>` + import | JAR (new ExtendedFixups) |
-| E08 | `package org\.neo4j\.driver\.v1 does not exist` | Neo4j v1 → v5 migration | Replace import prefix | JAR (existing) |
-| E09 | `cannot find symbol.*method getReasonPhrase` | `HttpStatusCode` API change | Wrap with `instanceof HttpStatus` ternary | JAR (existing) |
+| E04 | `cannot find symbol.*method ok\(` | `Results.ok()` remnant | Rewrite to `ResponseEntity.ok(...)` | JAR + Python fixer |
+| E05 | `incompatible types.*Result.*ResponseEntity` | Return type not updated | Change method return type to `ResponseEntity<JsonNode>` | JAR + Python fixer |
+| E06 | `package javax\.inject does not exist` | javax → jakarta migration | Replace `javax.inject` → `jakarta.inject` in imports | JAR |
+| E07 | `cannot find symbol.*class Provider` | `javax.inject.Provider` not rewritten | Replace with `ObjectProvider<T>` + import | JAR (ExtendedFixups) |
+| E08 | `package org\.neo4j\.driver\.v1 does not exist` | Neo4j v1 → v5 migration | Replace import prefix | JAR |
+| E09 | `cannot find symbol.*method getReasonPhrase` | `HttpStatusCode` API change | Wrap with `instanceof HttpStatus` ternary | JAR |
 | E10 | `method .* is already defined` | Duplicate method after transform | Remove duplicate (keep Spring version) | Python fixer |
 | E11 | `cannot find symbol.*class RestTemplate` | Missing bean definition | Add `@Bean RestTemplate` config class | Python fixer (generate config) |
-| E12 | `incompatible types.*CompletableFuture` | Missing type witness | Add `<ResponseEntity<JsonNode>>` type arg | JAR (existing) |
+| E12 | `incompatible types.*CompletableFuture` | Missing type witness | Add `<ResponseEntity<JsonNode>>` type arg | JAR |
 
 **Clustering key**: errors E01/E02 with the same symbol name across N files → 1 cluster.
 Errors E03 with the same Play package → 1 cluster.
@@ -349,8 +351,8 @@ Errors E03 with the same Play package → 1 cluster.
 
 Key changes from v1:
 - `errors_history` capped at 5 rounds (was 20) and stores fingerprints only (not full error objects)
-- New `det_fix_log` per unit: log of deterministic fixes applied (replaces implicit knowledge)
-- New `prompt_cache_key` in `autonomous`: hash of system prompt for cache invalidation
+- `det_fix_log` per unit: log of deterministic fixes applied
+- `prompt_cache_key` in `autonomous`: hash of system prompt for cache invalidation
 - `migration_units[].llm_calls` tracks LLM invocations per unit for budget enforcement
 
 ```typescript
@@ -384,7 +386,7 @@ interface MigrationStatusV2 {
     escalate_after_retries: number;
     max_files_per_cursor_session: number;
     last_errors_path: string | null;
-    prompt_cache_key: string | null;   // NEW: SHA256 of system_prompt text
+    prompt_cache_key: string | null;   // SHA256 of system_prompt text
   };
 
   migration_verification: MigrationVerification | null;
@@ -400,9 +402,9 @@ interface MigrationUnit {
   validate_iteration: number;
   last_error_count: number | null;
   llm_calls: number;
-  // NEW: capped ring buffer of error fingerprints (not full objects)
+  // Capped ring buffer of error fingerprints (not full objects)
   error_fingerprints: string[][];   // last 5 rounds, each round is sorted list of "file:line:msg"
-  // NEW: log of deterministic fixes applied this unit
+  // Log of deterministic fixes applied this unit
   det_fix_log: string[];
   failure_reason: string | null;
   discovered_by: string | null;
@@ -411,7 +413,7 @@ interface MigrationUnit {
 
 ### Backward Compatibility
 
-`merge_status()` is extended to handle v1 → v2 migration:
+A `migrate_v1_to_v2()` function handles transparent schema upgrades at orchestrator startup:
 
 ```python
 def migrate_v1_to_v2(raw: dict) -> dict:
@@ -424,7 +426,7 @@ def migrate_v1_to_v2(raw: dict) -> dict:
     """
 ```
 
-Old `errors_history` (list of full error dicts) is converted to `error_fingerprints`
+v1 `errors_history` (list of full error dicts) is converted to `error_fingerprints`
 (list of sorted signature strings) and truncated to 5 rounds. No data loss for resumability;
 the fingerprints are sufficient for loop detection.
 
@@ -822,7 +824,7 @@ Each new Python component has a corresponding test module:
 - `test_migrate_v1_to_v2.py`: round-trip test with real v1 status files from the repo
 
 For the Java toolkit:
-- `SpringCompileFixupsTest.java`: one test per new rewrite rule (existing pattern)
+- `SpringCompileFixupsTest.java`: one test per rewrite rule
 - `PlayToSpringTransformerTest.java`: integration test with a file containing `javax.inject.Provider`
 
 ### Property-Based Testing Approach
@@ -886,19 +888,18 @@ For a 10-unit project: ~5550s total savings (~92 minutes).
 
 ### Unit Discovery Caching
 
-`discover_migration_units()` currently runs `os.walk` on every orchestrator invocation.
-The redesign caches the result in `migration-status.json` under `migration_units` after the
-first successful discovery. Subsequent runs skip the walk entirely if all units are already
-present in the status file.
+`discover_migration_units()` will run `os.walk` on the first orchestrator invocation and cache
+the result in `migration-status.json` under `migration_units`. Subsequent runs skip the walk
+entirely if all units are already present in the status file.
 
 ---
 
 ## Security Considerations
 
-- The orchestrator passes absolute paths to cursor-agent. Paths are resolved with
+- The orchestrator passes absolute paths to cursor-agent. Paths should be resolved with
   `Path.resolve()` before use to prevent directory traversal.
-- The `CURSOR_API_KEY` is never written to `migration-status.json` or logged.
-  The `_argv_repr_redacted()` function already handles this for subprocess logging.
+- The `CURSOR_API_KEY` should never be written to `migration-status.json` or logged.
+  Subprocess argument logging should redact the key value.
 - The Python ErrorFixer writes `.bak` files before editing. These should be cleaned up
   after a successful compile to avoid leaking intermediate state.
 - Skill markdown files loaded from disk are not executed; they are only included as
@@ -915,22 +916,22 @@ present in the status file.
 - `prompt_builder.py` — stdlib only
 - `incremental_compiler.py` — stdlib only
 
-### New Java classes (no new Maven dependencies)
+### New Java methods (no new Maven dependencies)
 
-- Additional methods in `SpringCompileFixups.java` — uses existing JavaParser dependency
+- Additional methods in `SpringCompileFixups.java` — uses the JavaParser dependency already in scope
 - No new `pom.xml` entries required
 
 ### Test dependencies (dev only)
 
 - `hypothesis` (Python property tests): `pip install hypothesis`
-- `junit-quickcheck` (Java property tests): already in scope if added to test scope in `pom.xml`
+- `junit-quickcheck` (Java property tests): add to test scope in `pom.xml`
 
-### Existing dependencies (unchanged)
+### Runtime dependencies (unchanged)
 
 - `picocli` — CLI framework for dev-toolkit
 - `javaparser-core` — AST manipulation
 - `jackson-databind` — JSON in dev-toolkit
-- `cursor-agent` CLI — LLM executor (no change)
+- `cursor-agent` CLI — LLM executor
 
 
 ---

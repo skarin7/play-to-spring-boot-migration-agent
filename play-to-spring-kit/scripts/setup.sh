@@ -143,19 +143,86 @@ else
   echo "No kit lib/ found at $KIT_ROOT/lib (add dev-toolkit-1.0.0.jar for deterministic transform)"
 fi
 
-# Create Spring Boot project directory structure only — no templates.
-# The builder agent (LLM) will generate pom.xml, Application.java, and application.properties
-# by reading the Play project's build.sbt and application.conf for accurate dependencies and config.
-echo "Creating Spring Boot project at $SPRING_REPO"
-mkdir -p "$SPRING_REPO/src/main/java"
-mkdir -p "$SPRING_REPO/src/main/resources"
-mkdir -p "$SPRING_REPO/src/test/java"
-mkdir -p "$SPRING_REPO/src/test/resources"
+# Bootstrap Spring Boot project from start.spring.io (official Spring Initializr).
+# This gives a known-good pom.xml, Application.java, and directory layout — no LLM guessing
+# on Spring Boot version, Java version, or plugin config.
+# The builder agent only needs to add project-specific dependencies on top of this scaffold.
+#
+# Fallback: if curl/unzip are unavailable or the network is unreachable, create bare directories
+# so the rest of setup still works (builder agent will generate files from scratch as before).
 
-# Base package path
 PACKAGE_PATH=$(echo "$BASE_PACKAGE" | tr '.' '/')
-mkdir -p "$SPRING_REPO/src/main/java/$PACKAGE_PATH"
-mkdir -p "$SPRING_REPO/src/test/java/$PACKAGE_PATH"
+ARTIFACT_ID=$(echo "$PLAY_BASENAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+
+scaffold_from_initializr() {
+  local tmp_zip
+  tmp_zip=$(mktemp /tmp/spring-initializr-XXXXXX.zip)
+
+  echo "Fetching Spring Boot scaffold from start.spring.io..."
+  if ! curl -sf \
+      "https://start.spring.io/starter.zip" \
+      -d "type=maven-project" \
+      -d "language=java" \
+      -d "bootVersion=3.2.5" \
+      -d "baseDir=project" \
+      -d "groupId=${BASE_PACKAGE}" \
+      -d "artifactId=${ARTIFACT_ID}" \
+      -d "name=${ARTIFACT_ID}" \
+      -d "packageName=${BASE_PACKAGE}" \
+      -d "javaVersion=17" \
+      -d "dependencies=web" \
+      -o "$tmp_zip"; then
+    echo "  [warn] start.spring.io unreachable — falling back to bare directory scaffold."
+    rm -f "$tmp_zip"
+    return 1
+  fi
+
+  if ! command -v unzip &>/dev/null; then
+    echo "  [warn] unzip not found — falling back to bare directory scaffold."
+    rm -f "$tmp_zip"
+    return 1
+  fi
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d /tmp/spring-initializr-XXXXXX)
+  unzip -q "$tmp_zip" -d "$tmp_dir"
+  rm -f "$tmp_zip"
+
+  # Move extracted project/ into SPRING_REPO (idempotent: skip if pom.xml already exists)
+  if [[ -f "$SPRING_REPO/pom.xml" ]]; then
+    echo "  Spring repo already has pom.xml — skipping initializr scaffold (idempotent)."
+    rm -rf "$tmp_dir"
+    return 0
+  fi
+
+  mkdir -p "$SPRING_REPO"
+  cp -r "$tmp_dir/project/." "$SPRING_REPO/"
+  rm -rf "$tmp_dir"
+
+  # Rename the generated Application class to match base_package path
+  # (initializr uses artifactId-derived class name; rename to Application.java for consistency)
+  local gen_class
+  gen_class=$(find "$SPRING_REPO/src/main/java" -name "*Application.java" 2>/dev/null | head -1)
+  if [[ -n "$gen_class" && "$(basename "$gen_class")" != "Application.java" ]]; then
+    local target_dir
+    target_dir=$(dirname "$gen_class")
+    sed -i.bak "s/public class .*Application/public class Application/" "$gen_class"
+    mv "$gen_class" "$target_dir/Application.java"
+    rm -f "$target_dir/Application.java.bak"
+  fi
+
+  echo "  Scaffold extracted from start.spring.io (Spring Boot 3.2.5, Java 17, spring-web)."
+  return 0
+}
+
+echo "Creating Spring Boot project at $SPRING_REPO"
+if ! scaffold_from_initializr; then
+  # Bare fallback — same as before
+  mkdir -p "$SPRING_REPO/src/main/java/$PACKAGE_PATH"
+  mkdir -p "$SPRING_REPO/src/main/resources"
+  mkdir -p "$SPRING_REPO/src/test/java/$PACKAGE_PATH"
+  mkdir -p "$SPRING_REPO/src/test/resources"
+fi
 
 # workspace.yaml
 WORKSPACE_YAML="${WORKSPACE_DIR}/workspace.yaml"
