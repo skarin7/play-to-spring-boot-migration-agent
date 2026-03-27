@@ -52,46 +52,36 @@ Use this for **`migration_verification.spring_java_total`**. For **`layer_compar
 
 ## Step 1: Initialize Spring project
 
-Setup creates the directory structure but **no `pom.xml` or source files**. You generate them:
+`setup.sh` bootstraps the Spring repo from [start.spring.io](https://start.spring.io) — a known-good
+`pom.xml` (Spring Boot 3.2.5, Java 17, `spring-boot-starter-web`) and a minimal `Application.java`
+are already present. Your job is to add the project-specific dependencies and config.
 
-1. **Read `build.sbt`** in the Play repo. Map each dependency to its Maven equivalent:
-   - Play WS → `spring-boot-starter-web`
+1. **Check what's already there.** Read `pom.xml` in the Spring repo. It will have the parent BOM,
+   `spring-boot-starter-web`, and `spring-boot-maven-plugin` already wired. Do not regenerate it
+   from scratch.
+
+2. **Read `build.sbt`** in the Play repo. For each dependency not already covered by the web starter,
+   add the Maven equivalent inside the existing `<dependencies>` block:
    - MongoDB driver → `spring-boot-starter-data-mongodb`
    - Neo4j driver → `spring-boot-starter-data-neo4j` or `neo4j-java-driver`
-   - Jackson → `spring-boot-starter-json` (included in web starter)
-   - Guice → not needed (Spring DI replaces it)
-   - etc.
+   - Guice → remove (Spring DI replaces it)
+   - Any other third-party lib → find the Maven coordinates and add with explicit version
 
-2. **Generate `pom.xml`** in the Spring repo root:
-   - `spring-boot-starter-parent` 3.x
-   - Dependencies from the mapping above
-   - Java 17+ in properties
-   - `spring-boot-maven-plugin`
-   - Use `base_package` from `workspace.yaml` for groupId
-
-3. **Read `conf/application.conf`** in the Play repo. Map Play config keys to Spring equivalents in `src/main/resources/application.properties`:
-   - `play.http.secret.key` → not needed
+3. **Read `conf/application.conf`** in the Play repo. Append project-specific keys to
+   `src/main/resources/application.properties` (the file already exists from the scaffold):
    - `mongodb.uri` → `spring.data.mongodb.uri`
    - `play.server.http.port` → `server.port`
-   - etc.
+   - Skip Play-internal keys (`play.http.secret.key`, `akka.*`, etc.)
 
-4. **Generate `Application.java`** at `src/main/java/<base-package-path>/Application.java`. **`<base_package>` must be the application root** (e.g. `com.acme.myapp`), **not** a leaf folder like `…utils` or `…controllers`. `@SpringBootApplication` only component-scans that package and its children; if `Application` sits under `utils`, `@Component` classes in `db`/`service` are not registered and autowiring fails. If you cannot move the class, add `@SpringBootApplication(scanBasePackages = "<root>")` for the full migrated package tree. **`setup.sh`** writes a normalized `base_package` (trailing segments like `utils`, `service`, `db` are stripped from the first detected Play package).
+4. **Verify `Application.java`** is at `src/main/java/<base-package-path>/Application.java`.
+   The scaffold places it at the correct package. If `base_package` in `workspace.yaml` differs
+   from the generated package, move the file and update the `package` declaration.
 
-   ```java
-   package <base_package>;
+5. **Run `mvn -q compile`** from the Spring repo. Fix any errors (missing deps, wrong groupId,
+   etc.) until it exits 0.
 
-   import org.springframework.boot.SpringApplication;
-   import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-   @SpringBootApplication
-   public class Application {
-       public static void main(String[] args) {
-           SpringApplication.run(Application.class, args);
-       }
-   }
-   ```
-
-**After:** Update `migration-status.json` → `initialize.status = "done"`, set each `*_generated` flag to `true`, and populate **`source_inventory`** (see above) if not already present.
+**After:** Update `migration-status.json` → `initialize.status = "done"`, set each `*_generated`
+flag to `true`, and populate **`source_inventory`** (see above) if not already present.
 
 ## Step 2: Compile and fix until clean (per layer / per batch)
 
