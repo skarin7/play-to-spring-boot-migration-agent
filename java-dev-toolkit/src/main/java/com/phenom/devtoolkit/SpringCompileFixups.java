@@ -8,6 +8,7 @@ import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.CastExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
@@ -96,6 +97,18 @@ final class SpringCompileFixups {
         if (rewriteJavaxAnnotationImportsToJakarta(cu, result)) {
             // imports only
         }
+
+        // --- ExtendedFixups: additional deterministic Play→Spring rewrites ---
+        if (rewriteJavaxInjectProviderToObjectProvider(cu, result)) {
+            ensureImport(cu, "org.springframework.beans.factory.ObjectProvider");
+        }
+        if (rewriteProviderGetToGetObject(cu, result)) {
+            // method name only; no new imports needed
+        }
+        if (rewriteJavaxSingletonToComponent(cu, clazz, result)) {
+            ensureImport(cu, "org.springframework.stereotype.Component");
+        }
+
         if (rewriteNeo4jDriverV1ImportsAndTypes(cu, result)) {
             // ensureImport may run inside rewrite when needed
         }
@@ -563,6 +576,170 @@ final class SpringCompileFixups {
         if (!already) {
             cu.addImport(new ImportDeclaration(fqcn, false, false));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    //  ExtendedFixups: deterministic AST rewrites for common Play→Spring patterns
+    // -----------------------------------------------------------------------
+
+    /** Spring stereotype annotations that, when already present, suppress @Singleton→@Component rewriting. */
+    private static final Set<String> SPRING_STEREO_NAMES = new HashSet<>(Arrays.asList(
+            "Component", "Service", "Repository", "Controller", "RestController", "Configuration"
+    ));
+
+    /**
+     * E07: Rewrite {@code javax.inject.Provider<T>} field/parameter/variable types to
+     * {@code org.springframework.beans.factory.ObjectProvider<T>} and clean up the old import.
+     */
+    static boolean rewriteJavaxInjectProviderToObjectProvider(CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        // Only act if the file imports javax.inject.Provider (or jakarta.inject.Provider)
+        boolean hasProviderImport = cu.getImports().stream()
+                .anyMatch(i -> "javax.inject.Provider".equals(i.getNameAsString())
+                        || "jakarta.inject.Provider".equals(i.getNameAsString()));
+        if (!hasProviderImport) {
+            return false;
+        }
+
+        boolean any = false;
+
+        // Rewrite field types: Provider<T> → ObjectProvider<T>
+        for (FieldDeclaration fd : new ArrayList<>(cu.findAll(FieldDeclaration.class))) {
+            for (VariableDeclarator vd : fd.getVariables()) {
+                if (isProviderType(vd.getType())) {
+                    vd.setType(rewriteProviderType(vd.getType()));
+                    any = true;
+                }
+            }
+        }
+
+        // Rewrite constructor/method parameter types: Provider<T> → ObjectProvider<T>
+        for (Parameter p : new ArrayList<>(cu.findAll(Parameter.class))) {
+            if (isProviderType(p.getType())) {
+                p.setType(rewriteProviderType(p.getType()));
+                any = true;
+            }
+        }
+
+        // Rewrite method return types: Provider<T> → ObjectProvider<T>
+        for (MethodDeclaration md : new ArrayList<>(cu.findAll(MethodDeclaration.class))) {
+            if (isProviderType(md.getType())) {
+                md.setType(rewriteProviderType(md.getType()));
+                any = true;
+            }
+        }
+
+        if (any) {
+            // Remove old import
+            cu.getImports().removeIf(i -> "javax.inject.Provider".equals(i.getNameAsString())
+                    || "jakarta.inject.Provider".equals(i.getNameAsString()));
+            result.appliedChanges.add("javax.inject.Provider<T> → ObjectProvider<T>");
+        }
+        return any;
+    }
+
+    private static boolean isProviderType(Type type) {
+        if (!(type instanceof ClassOrInterfaceType)) {
+            return false;
+        }
+        ClassOrInterfaceType c = (ClassOrInterfaceType) type;
+        String name = c.getNameAsString();
+        return "Provider".equals(name) && c.getTypeArguments().isPresent();
+    }
+
+    private static Type rewriteProviderType(Type type) {
+        ClassOrInterfaceType c = (ClassOrInterfaceType) type;
+        ClassOrInterfaceType replacement = new ClassOrInterfaceType(null, "ObjectProvider");
+        replacement.setTypeArguments(c.getTypeArguments().get());
+        return replacement;
+    }
+
+    /**
+     * E07 companion: Rewrite {@code .get()} calls on {@code ObjectProvider} fields/variables to
+     * {@code .getObject()}. Must run after {@link #rewriteJavaxInjectProviderToObjectProvider}.
+     */
+    static boolean rewriteProviderGetToGetObject(CompilationUnit cu, PlayToSpringTransformer.TransformResult result) {
+        // Collect names of fields/variables typed ObjectProvider
+        Set<String> objectProviderNames = new HashSet<>();
+        for (FieldDeclaration fd : cu.findAll(FieldDeclaration.class)) {
+            for (VariableDeclarator vd : fd.getVariables()) {
+                if (vd.getType() instanceof ClassOrInterfaceType) {
+                    ClassOrInterfaceType ct = (ClassOrInterfaceType) vd.getType();
+                    if ("ObjectProvider".equals(ct.getNameAsString())) {
+                        objectProviderNames.add(vd.getNameAsString());
+                    }
+                }
+            }
+        }
+        for (Parameter p : cu.findAll(Parameter.class)) {
+            if (p.getType() instanceof ClassOrInterfaceType) {
+                ClassOrInterfaceType ct = (ClassOrInterfaceType) p.getType();
+                if ("ObjectProvider".equals(ct.getNameAsString())) {
+                    objectProviderNames.add(p.getNameAsString());
+                }
+            }
+        }
+        if (objectProviderNames.isEmpty()) {
+            return false;
+        }
+
+        boolean any = false;
+        for (MethodCallExpr m : new ArrayList<>(cu.findAll(MethodCallExpr.class))) {
+            if (!"get".equals(m.getNameAsString()) || !m.getArguments().isEmpty()) {
+                continue;
+            }
+            Optional<Expression> scope = m.getScope();
+            if (!scope.isPresent() || !scope.get().isNameExpr()) {
+                continue;
+            }
+            if (objectProviderNames.contains(scope.get().asNameExpr().getNameAsString())) {
+                m.setName("getObject");
+                any = true;
+            }
+        }
+        if (any) {
+            result.appliedChanges.add("ObjectProvider .get() → .getObject()");
+        }
+        return any;
+    }
+
+    /**
+     * Rewrite {@code @Singleton} on the primary class declaration to {@code @Component},
+     * unless a Spring stereotype ({@code @RestController}, {@code @Service}, etc.) is already present.
+     * Handles both {@code javax.inject.Singleton} and {@code com.google.inject.Singleton}.
+     */
+    static boolean rewriteJavaxSingletonToComponent(
+            CompilationUnit cu,
+            ClassOrInterfaceDeclaration clazz,
+            PlayToSpringTransformer.TransformResult result) {
+        // Skip if already has a Spring stereotype
+        boolean hasStereotype = clazz.getAnnotations().stream()
+                .anyMatch(a -> SPRING_STEREO_NAMES.contains(a.getNameAsString()));
+        if (hasStereotype) {
+            return false;
+        }
+
+        // Find @Singleton annotation
+        Optional<AnnotationExpr> singletonAnn = clazz.getAnnotations().stream()
+                .filter(a -> "Singleton".equals(a.getNameAsString()))
+                .findFirst();
+        if (!singletonAnn.isPresent()) {
+            return false;
+        }
+
+        // Replace @Singleton with @Component
+        clazz.getAnnotations().remove(singletonAnn.get());
+        clazz.addAnnotation(new MarkerAnnotationExpr("Component"));
+
+        // Remove old Singleton imports
+        cu.getImports().removeIf(i -> {
+            String n = i.getNameAsString();
+            return "javax.inject.Singleton".equals(n)
+                    || "jakarta.inject.Singleton".equals(n)
+                    || "com.google.inject.Singleton".equals(n);
+        });
+
+        result.appliedChanges.add("@Singleton → @Component (non-controller class)");
+        return true;
     }
 
     /**
