@@ -958,6 +958,79 @@ def merge_status(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Upgrade v1 migration-status.json to v2 schema in-place.
+
+    Changes:
+    - Sets ``schema_version: 2``
+    - Converts ``errors_history`` (list of full error dicts) to ``error_fingerprints``
+      (list of sorted ``"file:line:msg"`` string lists), truncated to last 5 entries
+    - Adds ``det_fix_log: []`` to each unit/layer that lacks it
+    - Adds ``prompt_cache_key: null`` to ``autonomous`` block if absent
+    - Preserves ``status``, ``files_migrated``, ``validate_iteration`` unchanged
+    """
+    if raw.get("schema_version") == 2:
+        return raw
+
+    raw["schema_version"] = 2
+
+    # Convert units
+    for u in raw.get("migration_units") or []:
+        if not isinstance(u, dict):
+            continue
+        _convert_errors_history_to_fingerprints(u)
+        u.setdefault("det_fix_log", [])
+        u.setdefault("llm_calls", 0)
+
+    # Convert layers
+    for _layer_name, le in (raw.get("layers") or {}).items():
+        if not isinstance(le, dict):
+            continue
+        _convert_errors_history_to_fingerprints(le)
+        le.setdefault("det_fix_log", [])
+
+    # Autonomous block
+    auto = raw.setdefault("autonomous", {})
+    auto.setdefault("prompt_cache_key", None)
+
+    return raw
+
+
+def _convert_errors_history_to_fingerprints(entry: dict[str, Any]) -> None:
+    """
+    Convert ``errors_history`` (v1: list of full error dicts) to
+    ``error_fingerprints`` (v2: list of sorted ``"file:line:msg"`` string lists),
+    truncated to last 5 entries.
+    """
+    hist = entry.pop("errors_history", None)
+    if entry.get("error_fingerprints") is not None:
+        return  # already converted
+
+    if hist is None:
+        entry["error_fingerprints"] = []
+        return
+
+    fingerprints: list[list[str]] = []
+    for round_errors in hist:
+        if isinstance(round_errors, list):
+            fps: list[str] = []
+            for e in round_errors:
+                if isinstance(e, dict):
+                    fp = e.get("file", "")
+                    line = e.get("line", 0)
+                    msg = (e.get("message") or "").strip()
+                    fps.append(f"{fp}:{line}:{msg}")
+                elif isinstance(e, str):
+                    fps.append(e)  # already a fingerprint string
+            fingerprints.append(sorted(fps))
+        elif isinstance(round_errors, str):
+            fingerprints.append([round_errors])
+
+    # Keep only last 5 rounds
+    entry["error_fingerprints"] = fingerprints[-5:]
+
+
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -2072,6 +2145,7 @@ def main() -> int:
 
     raw = json.loads(status_path.read_text(encoding="utf-8"))
     status = merge_status(raw)
+    status = migrate_v1_to_v2(status)  # v1 → v2 schema upgrade (no-op if already v2)
 
     reset_progress = bool(getattr(args, "reset_migration_progress", False)) or (
         os.environ.get("MIGRATION_RESET_PROGRESS", "").strip().lower()
