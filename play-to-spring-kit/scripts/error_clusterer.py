@@ -1,131 +1,136 @@
 #!/usr/bin/env python3
 """
-Error clusterer: groups compile errors by root cause before LLM dispatch.
+Group Maven compile errors by root cause before LLM dispatch.
 
-Reduces N separate error objects to K clusters (K << N), dramatically
-shrinking prompt size.
+Reduces N separate error objects to K clusters (K << N), dramatically shrinking
+prompt size. Each cluster carries a suggested_fix hint when the root cause matches
+a known taxonomy entry.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Optional
 
 # ---------------------------------------------------------------------------
-#  Taxonomy hint lookup (maps normalised template keys to suggested fixes)
+# Taxonomy hints (subset of E01–E12 that are useful as LLM hints)
 # ---------------------------------------------------------------------------
 
-_TAXONOMY_HINTS: dict[str, str] = {
-    "cannot_find_symbol:ObjectMapper": "Add import com.fasterxml.jackson.databind.ObjectMapper",
-    "cannot_find_symbol:JsonNode": "Add import com.fasterxml.jackson.databind.JsonNode",
-    "cannot_find_symbol:RestTemplate": "Add @Bean RestTemplate config class or import",
-    "cannot_find_symbol:Provider": "Replace javax.inject.Provider<T> with ObjectProvider<T>",
-    "package_does_not_exist:play": "Remove play.* import line",
-}
+_TAXONOMY_HINTS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"cannot find symbol.*class ObjectMapper", re.I),
+     "Add import com.fasterxml.jackson.databind.ObjectMapper"),
+    (re.compile(r"cannot find symbol.*class JsonNode", re.I),
+     "Add import com.fasterxml.jackson.databind.JsonNode"),
+    (re.compile(r"package play\.\w+ does not exist", re.I),
+     "Remove the play.* import line"),
+    (re.compile(r"cannot find symbol.*method ok\(", re.I),
+     "Replace ok( with ResponseEntity.ok("),
+    (re.compile(r"incompatible types.*Result.*ResponseEntity", re.I),
+     "Change method return type to ResponseEntity<JsonNode>"),
+    (re.compile(r"cannot find symbol.*class Provider", re.I),
+     "Replace javax.inject.Provider<T> with ObjectProvider<T>"),
+    (re.compile(r"method .* is already defined", re.I),
+     "Remove the duplicate method, keep the Spring-annotated version"),
+    (re.compile(r"cannot find symbol.*class RestTemplate", re.I),
+     "Add @Bean RestTemplate config class or import org.springframework.web.client.RestTemplate"),
+]
 
+
+def _taxonomy_hint(message: str) -> Optional[str]:
+    for pattern, hint in _TAXONOMY_HINTS:
+        if pattern.search(message):
+            return hint
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Template extraction
+# ---------------------------------------------------------------------------
+
+# Patterns to strip from error messages to produce a normalised template
+_STRIP_QUOTED = re.compile(r'"[^"]*"')          # quoted identifiers
+_STRIP_SYMBOL = re.compile(r"symbol:\s*\S+\s+")  # "symbol:   class Foo" → ""
+_STRIP_LOCATION = re.compile(r"location:\s*.+")  # "location: class Bar" → ""
+_STRIP_FILE_PATH = re.compile(r"[\w/\\.-]+\.java")  # file paths
+_STRIP_LINE_NUM = re.compile(r"\[\d+,\d+\]")     # [10,20]
+_STRIP_DIGITS = re.compile(r"\b\d+\b")           # bare numbers
+
+
+def extract_template(message: str) -> str:
+    """
+    Normalise an error message into a clustering key.
+
+    Strips file paths, line numbers, quoted identifiers, and specific symbol
+    names so that the same logical error across different files/symbols maps
+    to the same template.
+    """
+    t = message.strip().lower()
+    t = _STRIP_QUOTED.sub("<SYM>", t)
+    t = _STRIP_FILE_PATH.sub("<FILE>", t)
+    t = _STRIP_LINE_NUM.sub("", t)
+    t = _STRIP_SYMBOL.sub("", t)
+    t = _STRIP_LOCATION.sub("", t)
+    t = _STRIP_DIGITS.sub("<N>", t)
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ErrorCluster:
-    """A group of errors sharing the same root cause."""
-
-    root_cause: str
-    representative: dict
+    root_cause: str                          # normalised template key
+    representative: dict                     # one canonical error dict for the LLM
     affected_files: list[str] = field(default_factory=list)
-    count: int = 1
-    suggested_fix: str | None = None
+    count: int = 0
+    suggested_fix: Optional[str] = None
 
+
+# ---------------------------------------------------------------------------
+# Clusterer
+# ---------------------------------------------------------------------------
 
 class ErrorClusterer:
     """
-    Groups compile errors by normalised message template.
+    Groups compile errors by root cause.
 
-    Invariants:
-    - ``sum(c.count for c in clusters) == len(errors)``
+    Postconditions:
+    - sum(c.count for c in result) == len(errors)  (lossless)
     - Each error appears in exactly one cluster
-    - Clusters are sorted descending by ``count``
+    - Clusters sorted descending by count
     """
 
     def cluster(self, errors: list[dict]) -> list[ErrorCluster]:
-        if not errors:
-            return []
+        """
+        Cluster *errors* by normalised message template.
 
+        Returns clusters sorted descending by count.
+        """
         template_map: dict[str, ErrorCluster] = {}
 
         for error in errors:
-            template = self._extract_template(error.get("message", ""))
+            msg = error.get("message", "")
+            template = extract_template(msg)
+            fp = error.get("file", "unknown")
 
             if template in template_map:
                 c = template_map[template]
                 c.count += 1
-                f = error.get("file", "")
-                if f and f not in c.affected_files:
-                    c.affected_files.append(f)
+                if fp not in c.affected_files:
+                    c.affected_files.append(fp)
             else:
-                suggested = self._lookup_taxonomy_hint(template)
+                hint = _taxonomy_hint(msg)
                 c = ErrorCluster(
                     root_cause=template,
                     representative=error,
-                    affected_files=[error.get("file", "")] if error.get("file") else [],
+                    affected_files=[fp],
                     count=1,
-                    suggested_fix=suggested,
+                    suggested_fix=hint,
                 )
                 template_map[template] = c
 
-        clusters = sorted(template_map.values(), key=lambda c: -c.count)
-        return clusters
-
-    # -------------------------------------------------------------------
-    #  Template extraction
-    # -------------------------------------------------------------------
-
-    # Patterns to strip when normalising error messages
-    _FILE_PATH_RE = re.compile(r"(/[\w./-]+\.java|[\w.]+\.java)")
-    _LINE_NUMBER_RE = re.compile(r":\d+")
-    _QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
-
-    def _extract_template(self, message: str) -> str:
-        """
-        Normalise an error message into a clustering key.
-
-        Steps:
-        1. Strip file paths
-        2. Strip line numbers
-        3. Extract the symbol name from "cannot find symbol" messages
-        4. Lowercase
-        """
-        msg = message.strip()
-
-        # Extract symbol name for "cannot find symbol" errors
-        symbol_match = re.search(
-            r"cannot find symbol.*(?:class|method|variable)\s+(\w+)", msg, re.IGNORECASE
-        )
-        if symbol_match:
-            symbol = symbol_match.group(1)
-            return f"cannot_find_symbol:{symbol}"
-
-        # Extract package for "package X does not exist"
-        pkg_match = re.search(r"package\s+([\w.]+)\s+does not exist", msg, re.IGNORECASE)
-        if pkg_match:
-            pkg = pkg_match.group(1)
-            # Group play.* packages together
-            if pkg.startswith("play."):
-                return "package_does_not_exist:play"
-            return f"package_does_not_exist:{pkg}"
-
-        # Extract "incompatible types" pattern
-        if "incompatible types" in msg.lower():
-            return "incompatible_types"
-
-        # Extract "method is already defined"
-        if "is already defined" in msg.lower():
-            return "method_already_defined"
-
-        # Generic: clean up and use as-is
-        cleaned = self._FILE_PATH_RE.sub("<FILE>", msg)
-        cleaned = self._LINE_NUMBER_RE.sub("", cleaned)
-        cleaned = self._QUOTED_RE.sub("<Q>", cleaned)
-        return cleaned.lower().strip()
-
-    def _lookup_taxonomy_hint(self, template: str) -> str | None:
-        """Look up a suggested fix from the taxonomy table."""
-        return _TAXONOMY_HINTS.get(template)
+        return sorted(template_map.values(), key=lambda c: -c.count)

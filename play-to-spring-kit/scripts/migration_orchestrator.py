@@ -59,6 +59,17 @@ from pathlib import Path
 import time
 from typing import Any
 
+# New components — imported lazily so the orchestrator still works if they are absent
+# (e.g. during a partial install). Actual usage is guarded by try/except at call sites.
+try:
+    from compile_error_fixer import CompileErrorFixer, FixResult as _FixResult  # noqa: F401
+    from error_clusterer import ErrorClusterer
+    from incremental_compiler import IncrementalCompiler
+    from prompt_builder import PromptBuilder
+    _NEW_COMPONENTS_AVAILABLE = True
+except ImportError:
+    _NEW_COMPONENTS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Defaults (override via env / CLI)
 # ---------------------------------------------------------------------------
@@ -909,6 +920,67 @@ def default_autonomous() -> dict[str, Any]:
         ),
         "last_errors_path": None,
     }
+
+
+def migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Upgrade a v1 migration-status.json dict to v2 schema in-place.
+
+    - Sets schema_version: 2
+    - Converts errors_history (list of full error dicts) → error_fingerprints
+      (list of sorted "file:line:msg" string lists), capped at last 5 entries
+    - Adds det_fix_log: [] to each unit/layer that lacks it
+    - Adds prompt_cache_key: null to autonomous block if absent
+    - Preserves status, files_migrated, validate_iteration for every unit unchanged
+    - Returns raw unchanged if schema_version is already 2
+    """
+    if raw.get("schema_version") == 2:
+        return raw
+
+    out = dict(raw)
+    out["schema_version"] = 2
+
+    def _convert_unit(u: dict[str, Any]) -> dict[str, Any]:
+        u = dict(u)
+        # Convert errors_history → error_fingerprints
+        history = u.pop("errors_history", []) or []
+        fingerprints: list[list[str]] = []
+        for round_errors in history:
+            if isinstance(round_errors, list):
+                fps = sorted(
+                    f"{e.get('file', '')}:{e.get('line', 0)}:{(e.get('message') or '').strip()}"
+                    for e in round_errors
+                    if isinstance(e, dict)
+                )
+                fingerprints.append(fps)
+            # If already a list of strings (partially migrated), keep as-is
+            elif isinstance(round_errors, str):
+                fingerprints.append([round_errors])
+        u["error_fingerprints"] = fingerprints[-5:]  # keep last 5 rounds
+        # Add det_fix_log if absent
+        u.setdefault("det_fix_log", [])
+        return u
+
+    # Migrate migration_units
+    raw_mu = out.get("migration_units")
+    if isinstance(raw_mu, list):
+        out["migration_units"] = [
+            _convert_unit(u) if isinstance(u, dict) else u
+            for u in raw_mu
+        ]
+
+    # Migrate layers
+    layers = out.get("layers") or {}
+    out["layers"] = {
+        lyr: _convert_unit(le) if isinstance(le, dict) else le
+        for lyr, le in layers.items()
+    }
+
+    # Add prompt_cache_key to autonomous block
+    auto = out.setdefault("autonomous", {})
+    auto.setdefault("prompt_cache_key", None)
+
+    return out
 
 
 def merge_status(raw: dict[str, Any]) -> dict[str, Any]:
@@ -2310,6 +2382,12 @@ def main() -> int:
         # Signatures from prior slices that ended loop_detected / max_retries — omit from LLM prompts.
         excluded_error_signatures: set[str] = set()
 
+        # Instantiate new components once per run (8.1, 8.2, 8.3)
+        _compiler = IncrementalCompiler(spring_repo, dry_run=args.dry_run) if _NEW_COMPONENTS_AVAILABLE else None
+        _fixer_cls = CompileErrorFixer if _NEW_COMPONENTS_AVAILABLE else None
+        _clusterer = ErrorClusterer() if _NEW_COMPONENTS_AVAILABLE else None
+        _prompt_builder = PromptBuilder(spring_repo, play_repo, status_path) if _NEW_COMPONENTS_AVAILABLE else None
+
         for label, le, layer_arg, path_prefix_arg in entity_iterable:
             if le.get("status") == "done":
                 continue
@@ -2358,7 +2436,29 @@ def main() -> int:
                 le["status"] = "compiling"
                 atomic_write_json(status_path, status)
 
-                code, log = run_mvn_compile(spring_repo, args.dry_run)
+                # 8.1: Use IncrementalCompiler when available, fall back to run_mvn_compile
+                if _compiler is not None:
+                    compile_result = _compiler.compile()
+                    code = compile_result.returncode
+                    log = compile_result.log
+                    # 8.1: infrastructure error detection via IncrementalCompiler
+                    if compile_result.is_infrastructure_error:
+                        le["status"] = "needs_manual_fix"
+                        le["failure_reason"] = "infrastructure_error"
+                        LOG.error(
+                            "Slice %r: infrastructure error detected (JDK/Lombok crash). "
+                            "Fix pom.xml or JDK — not fixable by editing app Java.",
+                            label,
+                        )
+                        status["failed_layers"].append(
+                            {"layer": label, "reason": "infrastructure_error",
+                             "last_errors_summary": [log[-500:]]}
+                        )
+                        atomic_write_json(status_path, status)
+                        break
+                else:
+                    code, log = run_mvn_compile(spring_repo, args.dry_run)
+
                 le["validate_iteration"] = int(le.get("validate_iteration", 0)) + 1
                 err_count = count_compilation_errors(log) or len(parse_mvn_errors(log))
                 le["last_error_count"] = err_count
@@ -2392,6 +2492,9 @@ def main() -> int:
                     le["failure_reason"] = None
                     le["errors_history"] = []
                     le.pop("compile_error_counts", None)
+                    # 8.2: clean up .bak files after successful compile
+                    if _fixer_cls is not None and hasattr(le, "_active_fixer"):
+                        le["_active_fixer"].delete_bak_files()
                     atomic_write_json(status_path, status)
                     break
 
@@ -2429,10 +2532,49 @@ def main() -> int:
                     atomic_write_json(status_path, status)
                     continue
 
-                norm = normalize_errors(errors)
+                # 8.2: Run Python deterministic fixer on code errors before LLM dispatch
+                if _fixer_cls is not None and code_e:
+                    _fixer = _fixer_cls(spring_repo, dry_run=args.dry_run)
+                    fix_result = _fixer.run(code_e)
+                    # Extend det_fix_log
+                    det_log = le.setdefault("det_fix_log", [])
+                    det_log.extend(fix_result.det_fix_log)
+                    if fix_result.det_fix_log:
+                        LOG.info(
+                            "Slice %r: deterministic fixer applied %d fix(es): %s",
+                            label, fix_result.fixed_count,
+                            "; ".join(fix_result.det_fix_log[:3]),
+                        )
+                    # If fixer resolved everything, re-compile without LLM
+                    if fix_result.fixed_count > 0 and not fix_result.unresolved:
+                        atomic_write_json(status_path, status)
+                        continue
+                    # Replace code_e with only the unresolved errors for LLM dispatch
+                    code_e = fix_result.unresolved
+
+                # 8.4: Fingerprint-based loop detection (replaces errors_history for v2)
+                norm = normalize_errors(code_e + dep)
+                fps: list[list[str]] = list(le.get("error_fingerprints") or [])
+                # Also keep legacy errors_history for backward compat
                 hist: list[list[str]] = list(le.get("errors_history") or [])
 
-                if is_looping(norm, hist):
+                # Check fingerprint match (stuck detection)
+                if fps and norm == fps[-1]:
+                    llm_calls_so_far = int(le.get("llm_calls", 0))
+                    if llm_calls_so_far >= gr.escalate_after_retries:
+                        le["status"] = "failed"
+                        le["failure_reason"] = "stuck"
+                        for sig in norm:
+                            excluded_error_signatures.add(sig)
+                        status["failed_layers"].append(
+                            {"layer": label, "reason": "stuck",
+                             "last_errors_summary": norm[:20]}
+                        )
+                        atomic_write_json(status_path, status)
+                        if args.fail_fast:
+                            return 5
+                        break
+                elif is_looping(norm, hist):
                     le["status"] = "loop_detected"
                     le["failure_reason"] = "loop_detected"
                     for sig in norm:
@@ -2538,7 +2680,12 @@ def main() -> int:
                                 f'\nPlay ``app/`` path prefix for this slice: '
                                 f'"{path_prefix_arg or "(whole app)"}"'
                             )
-                        prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
+                        # 8.3: Use PromptBuilder when available, fall back to inline prompt
+                        if _prompt_builder is not None and _clusterer is not None:
+                            clusters = _clusterer.cluster(top)
+                            prompt = _prompt_builder.fix_prompt(clusters, spring_repo)
+                        else:
+                            prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
 Errors (JSON, top {len(top)}):
 {json.dumps(top, indent=2)}
 {dep_hint}
@@ -2577,12 +2724,17 @@ Rules:
                     le["retry_count"] = int(le.get("retry_count", 0)) + 1
                     hist.append(norm)
                     le["errors_history"] = hist[-20:]
+                    # 8.4: update error_fingerprints ring buffer (last 5 rounds)
+                    fps.append(norm)
+                    le["error_fingerprints"] = fps[-5:]
                     atomic_write_json(status_path, status)
                 else:
                     # No cursor: no code changes; stuck detection uses compile_error_counts only
                     le["retry_count"] = int(le.get("retry_count", 0)) + 1
                     hist.append(norm)
                     le["errors_history"] = hist[-20:]
+                    fps.append(norm)
+                    le["error_fingerprints"] = fps[-5:]
                     atomic_write_json(status_path, status)
                 # loop: compile again
 
@@ -2594,8 +2746,12 @@ Rules:
                 atomic_write_json(status_path, status)
                 return 5
 
-        # Final compile check
-        code, _ = run_mvn_compile(spring_repo, args.dry_run)
+        # 8.5: Cross-module full-compile verification pass using IncrementalCompiler
+        if _compiler is not None:
+            final_result = _compiler.compile()  # no changed_files → full compile
+            code = final_result.returncode
+        else:
+            code, _ = run_mvn_compile(spring_repo, args.dry_run)
         if code != 0:
             print(
                 "WARNING: final mvn compile failed after all migration slices.",
