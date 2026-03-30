@@ -1,2 +1,4 @@
 # Local Python env for migration_orchestrator (created by repo start_upgrade.sh)
 .venv/
+__pycache__/
+*.pyc
