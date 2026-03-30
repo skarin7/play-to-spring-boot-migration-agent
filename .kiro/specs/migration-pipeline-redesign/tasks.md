@@ -9,8 +9,8 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
 
 ## Tasks
 
-- [ ] 1. Add ExtendedFixups AST rules to SpringCompileFixups
-  - [~] 1.1 Implement `rewriteJavaxInjectProviderToObjectProvider` in `SpringCompileFixups.java`
+- [x] 1. Add ExtendedFixups AST rules to SpringCompileFixups
+  - [x] 1.1 Implement `rewriteJavaxInjectProviderToObjectProvider` in `SpringCompileFixups.java`
     - Add static method following the existing `rewriteXxx(CompilationUnit, TransformResult)` pattern
     - Rewrite `javax.inject.Provider<T>` field/parameter types to `org.springframework.beans.factory.ObjectProvider<T>`
     - Call `ensureImport(cu, "org.springframework.beans.factory.ObjectProvider")` when applied
@@ -18,13 +18,13 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - Wire the call into `SpringCompileFixups.apply()` after the existing javax.inject block
     - _Requirements: 3.1, 3.5_
 
-  - [~] 1.2 Implement `rewriteProviderGetToGetObject` in `SpringCompileFixups.java`
+  - [x] 1.2 Implement `rewriteProviderGetToGetObject` in `SpringCompileFixups.java`
     - Find all `MethodCallExpr` nodes where method name is `get` and scope resolves to an `ObjectProvider` field
     - Replace `.get()` with `.getObject()`
     - Wire into `SpringCompileFixups.apply()`
     - _Requirements: 3.2, 3.5_
 
-  - [~] 1.3 Implement `rewriteJavaxSingletonToComponent` in `SpringCompileFixups.java`
+  - [x] 1.3 Implement `rewriteJavaxSingletonToComponent` in `SpringCompileFixups.java`
     - Find `@Singleton` annotations on the primary class declaration
     - Skip if the class already has a Spring stereotype (`@RestController`, `@Service`, etc.)
     - Replace `@Singleton` with `@Component` and call `ensureImport(cu, "org.springframework.stereotype.Component")`
@@ -39,8 +39,8 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - Verify Provider round-trip: file with `javax.inject.Provider<T>` and `.get()` calls has no remaining `javax.inject.Provider` after apply (Property 11)
     - _Requirements: 3.1, 3.2, 3.3, 3.4_
 
-- [ ] 2. Implement `compile_error_fixer.py`
-  - [~] 2.1 Create `play-to-spring-kit/scripts/compile_error_fixer.py` with `FixResult` dataclass and `CompileErrorFixer` class skeleton
+- [x] 2. Implement `compile_error_fixer.py`
+  - [x] 2.1 Create `play-to-spring-kit/scripts/compile_error_fixer.py` with `FixResult` dataclass and `CompileErrorFixer` class skeleton
     - Define `FixResult(fixed_count: int, unresolved: list[dict], det_fix_log: list[str])`
     - Define `CompileErrorFixer.__init__(self, spring_repo: Path, dry_run: bool = False)`
     - Implement `.bak` backup logic: write `<file>.bak` before any edit; delete on successful compile round
@@ -48,7 +48,7 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - Ensure no file under `play_repo` is ever modified (validate path prefix before writing)
     - _Requirements: 4.2, 4.3, 4.4_
 
-  - [~] 2.2 Implement taxonomy rules E01–E12 in `CompileErrorFixer.run()`
+  - [x] 2.2 Implement taxonomy rules E01–E12 in `CompileErrorFixer.run()`
     - E01: `cannot find symbol.*class ObjectMapper` → add `import com.fasterxml.jackson.databind.ObjectMapper;`
     - E02: `cannot find symbol.*class JsonNode` → add `import com.fasterxml.jackson.databind.JsonNode;`
     - E03: `package play\.\w+ does not exist` → remove matching Play import line
@@ -77,8 +77,8 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - Test backup/revert: inject a bad fix, assert file reverted from `.bak`
     - _Requirements: 4.2, 4.3, 4.5–4.10_
 
-- [ ] 3. Implement `error_clusterer.py`
-  - [~] 3.1 Create `play-to-spring-kit/scripts/error_clusterer.py` with `ErrorCluster` dataclass and `ErrorClusterer` class
+- [x] 3. Implement `error_clusterer.py`
+  - [x] 3.1 Create `play-to-spring-kit/scripts/error_clusterer.py` with `ErrorCluster` dataclass and `ErrorClusterer` class
     - Define `ErrorCluster(root_cause, representative, affected_files, count, suggested_fix)`
     - Implement `extract_template(message)`: strip file paths, line numbers, quoted identifiers; lowercase
     - Implement `cluster(errors)`: group by template, populate `suggested_fix` from taxonomy lookup, sort descending by `count`
@@ -97,11 +97,11 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - **Property 7: Clusterer same-template grouping** — N errors with identical normalized template → exactly 1 cluster with `count == N`
     - **Validates: Requirements 5.4**
 
-- [~] 4. Checkpoint — ensure Java toolkit builds and Python fixer/clusterer tests pass
+- [x] 4. Checkpoint — ensure Java toolkit builds and Python fixer/clusterer tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 5. Implement `prompt_builder.py`
-  - [~] 5.1 Create `play-to-spring-kit/scripts/prompt_builder.py` with `PromptBuilder` class
+- [x] 5. Implement `prompt_builder.py`
+  - [x] 5.1 Create `play-to-spring-kit/scripts/prompt_builder.py` with `PromptBuilder` class
     - Implement `system_prompt(spring_repo, play_repo, status_path) -> str`: static context ≤200 tokens; include repo paths and forbidden-actions rules
     - Implement `fix_prompt(clusters, spring_repo) -> str`: include at most 5 clusters; per-cluster: root_cause, representative file+line+message, suggested_fix hint if present, affected_files[1:3] if count > 1; footer forbidding Play source edits; target ≤500 tokens
     - Implement `bootstrap_prompt(play_repo, spring_repo, status_path, step1_md) -> str`: inline step1_md once; target ≤1000 tokens total
@@ -118,8 +118,8 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - **Property 9: Fix prompt token budget** — `fix_prompt()` produces ≤500 tokens for any list of up to 5 `ErrorCluster` objects
     - **Validates: Requirements 2.2**
 
-- [ ] 6. Implement `incremental_compiler.py`
-  - [~] 6.1 Create `play-to-spring-kit/scripts/incremental_compiler.py` with `CompileResult` dataclass and `IncrementalCompiler` class
+- [x] 6. Implement `incremental_compiler.py`
+  - [x] 6.1 Create `play-to-spring-kit/scripts/incremental_compiler.py` with `CompileResult` dataclass and `IncrementalCompiler` class
     - Define `CompileResult(returncode, log, errors, duration_sec)`
     - Implement `_resolve_module(file) -> str | None`: parse `pom.xml` files under `spring_repo` to find the Maven module containing `file`; return `None` for single-module projects
     - Implement `compile(changed_files=None) -> CompileResult`:
@@ -136,8 +136,8 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - Use a mock/stub `subprocess.run` that returns controlled output; generate arbitrary error lists
     - Create `play-to-spring-kit/tests/test_incremental_compiler.py`
 
-- [ ] 7. Implement `migrate_v1_to_v2` in `migration_orchestrator.py`
-  - [~] 7.1 Add `migrate_v1_to_v2(raw: dict) -> dict` function to `migration_orchestrator.py`
+- [x] 7. Implement `migrate_v1_to_v2` in `migration_orchestrator.py`
+  - [x] 7.1 Add `migrate_v1_to_v2(raw: dict) -> dict` function to `migration_orchestrator.py`
     - If `raw.get("schema_version") == 2`, return `raw` unchanged
     - Set `schema_version: 2`
     - For each unit/layer entry: convert `errors_history` (list of full error dicts) to `error_fingerprints` (list of sorted `"file:line:msg"` string lists), truncated to last 5 entries
@@ -155,27 +155,27 @@ Java ExtendedFixups first (foundation for deterministic coverage), then new Pyth
     - **Property 13: v1→v2 fingerprint conversion is bounded** — for a unit with `errors_history` of length L, `error_fingerprints` has length `min(L, 5)` and each entry is a list of strings
     - **Validates: Requirements 8.3**
 
-- [ ] 8. Wire new components into the orchestrator loop
-  - [~] 8.1 Integrate `IncrementalCompiler` into the transform-validate loop in `migration_orchestrator.py`
+- [-] 8. Wire new components into the orchestrator loop
+  - [ ] 8.1 Integrate `IncrementalCompiler` into the transform-validate loop in `migration_orchestrator.py`
     - Replace direct `subprocess.run(["mvn", "compile", ...])` calls in the per-unit validate loop with `IncrementalCompiler(spring_repo).compile(changed_files=last_edited_files)`
     - Detect infrastructure errors (JDK crash, Lombok annotation processor failure) from `CompileResult.log`; exit with code 5 without marking unit failed
     - _Requirements: 7.4, 7.5, 7.6, 10.2_
 
-  - [~] 8.2 Integrate `CompileErrorFixer` and `ErrorClusterer` into the validate loop
+  - [ ] 8.2 Integrate `CompileErrorFixer` and `ErrorClusterer` into the validate loop
     - After each compile failure, call `CompileErrorFixer(spring_repo).run(code_errors)` before dispatching to cursor-agent
     - Extend `unit["det_fix_log"]` with `fix_result.det_fix_log`
     - Only cluster and dispatch to cursor-agent when `fix_result.unresolved` is non-empty
     - Delete `.bak` files after a successful compile round
     - _Requirements: 1.1, 1.2, 1.3, 4.4, 10.1, 10.3_
 
-  - [~] 8.3 Integrate `PromptBuilder` and replace inline prompt construction
+  - [ ] 8.3 Integrate `PromptBuilder` and replace inline prompt construction
     - Instantiate `PromptBuilder` once per orchestrator run
     - Replace bootstrap prompt string with `prompt_builder.bootstrap_prompt(...)`
     - Replace per-fix cursor-agent prompt with `prompt_builder.fix_prompt(clusters, spring_repo)`
     - Pass `system_prompt()` as the `--system-prompt` argument to cursor-agent (sent once per session)
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 6.1–6.5_
 
-  - [~] 8.4 Implement error fingerprint loop detection and budget enforcement
+  - [ ] 8.4 Implement error fingerprint loop detection and budget enforcement
     - After each deterministic+LLM round, compute `current_fps = sorted("file:line:msg" for each unresolved error)`
     - Compare against `unit["error_fingerprints"]`; if match found and `unit["llm_calls"] >= escalate_after_retries`, mark unit `failed` with `failure_reason = "stuck"` and continue to next unit
     - Append `current_fps` to `unit["error_fingerprints"]`, keeping only last 5 entries
