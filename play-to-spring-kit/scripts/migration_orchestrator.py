@@ -1513,6 +1513,7 @@ def call_cursor_agent(
     force: bool = False,
     stream_output: bool = True,
     run_label: str = "cursor-agent",
+    system_prompt: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # Flags per https://cursor.com/docs/cli/reference/parameters
     argv: list[str] = [
@@ -1529,6 +1530,8 @@ def call_cursor_agent(
     ]
     if force:
         argv.append("--force")
+    if system_prompt:
+        argv.extend(["--system-prompt", system_prompt])
     ws = workspace if workspace is not None else cwd
     if ws is not None:
         argv.extend(["--workspace", str(ws.resolve())])
@@ -1705,6 +1708,7 @@ def bootstrap_initialize_via_cursor_agent(
     timeout_sec: int,
     dry_run: bool,
     max_attempts: int = 2,
+    prompt_builder: Any = None,
 ) -> bool:
     """
     Spawn cursor-agent for Spring init only (builder Step 1), not full orchestration.
@@ -1712,7 +1716,12 @@ def bootstrap_initialize_via_cursor_agent(
     Returns True if afterward initialize.status == done in migration-status.json.
     """
     skill_md = load_builder_skill_step1_markdown(play_repo)
-    prompt = f"""You are invoked by the Play→Spring **migration_orchestrator.py** script (headless, non-interactive).
+
+    # 8.3: Use PromptBuilder.bootstrap_prompt() when available
+    if prompt_builder is not None:
+        prompt = prompt_builder.bootstrap_prompt(step1_md=skill_md)
+    else:
+        prompt = f"""You are invoked by the Play→Spring **migration_orchestrator.py** script (headless, non-interactive).
 
 ## Task — bootstrap / init ONLY (then STOP)
 
@@ -2239,6 +2248,8 @@ def main() -> int:
         if use_cursor:
             model_init = resolve_model(args, status)
             gr_init = load_guardrails(args, status)
+            # 8.3: Create PromptBuilder early for bootstrap prompt
+            _boot_pb = PromptBuilder(spring_repo, play_repo, status_path) if _NEW_COMPONENTS_AVAILABLE else None
             ok = bootstrap_initialize_via_cursor_agent(
                 play_repo=play_repo,
                 spring_repo=spring_repo,
@@ -2249,6 +2260,7 @@ def main() -> int:
                 api_key=api_key,
                 timeout_sec=gr_init.cursor_agent_timeout_sec,
                 dry_run=args.dry_run,
+                prompt_builder=_boot_pb,
             )
             if not ok:
                 print(
@@ -2416,6 +2428,8 @@ def main() -> int:
                 )
 
             # Compile / fix loop
+            _last_fixer = None          # 8.2: track fixer for .bak cleanup
+            last_edited_files = None    # 8.1: changed_files for IncrementalCompiler
             while True:
                 elapsed_mins = (time.monotonic() - entity_start_time[label]) / 60.0
                 if elapsed_mins > gr.timeout_layer_mins:
@@ -2438,7 +2452,8 @@ def main() -> int:
 
                 # 8.1: Use IncrementalCompiler when available, fall back to run_mvn_compile
                 if _compiler is not None:
-                    compile_result = _compiler.compile()
+                    compile_result = _compiler.compile(changed_files=last_edited_files)
+                    last_edited_files = None  # reset after use
                     code = compile_result.returncode
                     log = compile_result.log
                     # 8.1: infrastructure error detection via IncrementalCompiler
@@ -2493,8 +2508,9 @@ def main() -> int:
                     le["errors_history"] = []
                     le.pop("compile_error_counts", None)
                     # 8.2: clean up .bak files after successful compile
-                    if _fixer_cls is not None and hasattr(le, "_active_fixer"):
-                        le["_active_fixer"].delete_bak_files()
+                    if _last_fixer is not None:
+                        _last_fixer.delete_bak_files()
+                        _last_fixer = None
                     atomic_write_json(status_path, status)
                     break
 
@@ -2535,7 +2551,11 @@ def main() -> int:
                 # 8.2: Run Python deterministic fixer on code errors before LLM dispatch
                 if _fixer_cls is not None and code_e:
                     _fixer = _fixer_cls(spring_repo, dry_run=args.dry_run)
+                    _last_fixer = _fixer
                     fix_result = _fixer.run(code_e)
+                    # 8.1: track files edited by fixer for IncrementalCompiler
+                    if _fixer._backed_up:
+                        last_edited_files = list(_fixer._backed_up.keys())
                     # Extend det_fix_log
                     det_log = le.setdefault("det_fix_log", [])
                     det_log.extend(fix_result.det_fix_log)
@@ -2698,6 +2718,8 @@ Rules:
 - Spring repo root: {spring_repo}
 - Play repo (read originals if needed): {play_repo}
 """
+                        # 8.3: Pass system_prompt (sent once per session, cached by cursor-agent)
+                        _sys_prompt = _prompt_builder.system_prompt() if _prompt_builder is not None else None
                         proc = call_cursor_agent(
                             attempt_model,
                             prompt,
@@ -2710,6 +2732,7 @@ Rules:
                             run_label=(
                                 f"compile-fix slice={label} model={attempt_model}"
                             ),
+                            system_prompt=_sys_prompt,
                         )
                         if proc.returncode != 0:
                             LOG.warning(
@@ -2746,17 +2769,41 @@ Rules:
                 atomic_write_json(status_path, status)
                 return 5
 
-        # 8.5: Cross-module full-compile verification pass using IncrementalCompiler
+        # 8.5: Cross-module full-compile verification pass
+        # After all units are done, run a full compile. If it fails, feed errors
+        # back into the deterministic-first loop for affected units.
         if _compiler is not None:
             final_result = _compiler.compile()  # no changed_files → full compile
-            code = final_result.returncode
+            final_code = final_result.returncode
+            final_log = final_result.log
         else:
-            code, _ = run_mvn_compile(spring_repo, args.dry_run)
-        if code != 0:
-            print(
-                "WARNING: final mvn compile failed after all migration slices.",
-                file=sys.stderr,
+            final_code, final_log = run_mvn_compile(spring_repo, args.dry_run)
+        if final_code != 0:
+            LOG.warning(
+                "Cross-module full compile failed after all slices; "
+                "feeding errors back through deterministic fixer."
             )
+            xmod_errors = parse_mvn_errors(final_log)
+            if xmod_errors and _fixer_cls is not None:
+                xmod_fixer = _fixer_cls(spring_repo, dry_run=args.dry_run)
+                xmod_fix_result = xmod_fixer.run(xmod_errors)
+                if xmod_fix_result.det_fix_log:
+                    LOG.info(
+                        "Cross-module verify: deterministic fixer applied %d fix(es)",
+                        xmod_fix_result.fixed_count,
+                    )
+                # Re-compile after deterministic fixes
+                if xmod_fix_result.fixed_count > 0:
+                    if _compiler is not None:
+                        recheck = _compiler.compile()
+                        final_code = recheck.returncode
+                    else:
+                        final_code, _ = run_mvn_compile(spring_repo, args.dry_run)
+            if final_code != 0:
+                LOG.warning(
+                    "Final mvn compile still failing after cross-module deterministic fixes. "
+                    "Manual intervention may be needed."
+                )
 
         status["current_step"] = "verify"
         status["migration_verification"] = run_verification(status, play_repo, spring_repo)
