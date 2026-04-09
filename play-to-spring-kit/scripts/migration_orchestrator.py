@@ -1379,6 +1379,8 @@ class Guardrails:
     fix_model: str = DEFAULT_CURSOR_MODEL
     escalate_model: str = DEFAULT_CURSOR_MODEL
     escalate_after_retries: int = 2
+    max_error_message_chars: int = 220
+    max_prompt_chars: int = 6000
 
 
 def load_guardrails(args: argparse.Namespace, status: dict[str, Any]) -> Guardrails:
@@ -1426,6 +1428,12 @@ def load_guardrails(args: argparse.Namespace, status: dict[str, Any]) -> Guardra
                     )
                 ),
             )
+        ),
+        max_error_message_chars=int(
+            os.environ.get("MAX_ERROR_MESSAGE_CHARS", "220")
+        ),
+        max_prompt_chars=int(
+            os.environ.get("MAX_PROMPT_CHARS", "6000")
         ),
     )
 
@@ -1499,6 +1507,95 @@ def build_error_batches(
     if not batches and errors:
         batches.append(errors[:])
     return batches
+
+
+def _repo_relative_path(file_path: str, repo_root: Path) -> str:
+    """Shorten file paths for prompts while keeping stable identifiers."""
+    if not file_path or file_path == "unknown":
+        return "unknown"
+    try:
+        p = Path(file_path)
+        if p.is_absolute():
+            return p.resolve().relative_to(repo_root.resolve()).as_posix()
+        return p.as_posix()
+    except Exception:
+        return Path(file_path).name or str(file_path)
+
+
+def _compact_error_message(message: str, max_chars: int) -> str:
+    msg = re.sub(r"\s+", " ", (message or "").strip())
+    if len(msg) <= max_chars:
+        return msg
+    if max_chars <= 1:
+        return msg[:max_chars]
+    return msg[: max_chars - 1].rstrip() + "…"
+
+
+def _message_code(message: str) -> str:
+    msg = (message or "").strip()
+    m = re.match(r"([A-Za-z][A-Za-z0-9_.-]{1,40})[:\s].*", msg)
+    if m:
+        return m.group(1)
+    return "ERR"
+
+
+def build_compact_llm_payload(
+    *,
+    errors: list[dict[str, Any]],
+    spring_repo: Path,
+    max_files: int,
+    max_errors_per_file: int,
+    max_message_chars: int,
+    max_total_chars: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Deterministically trim compile errors into a token-efficient payload.
+    Returns compact error dicts + one-line diagnostics for prompt fallback.
+    """
+    if not errors:
+        return [], []
+    by_file = group_errors_by_file(errors)
+    ranked_files = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+
+    compact_errors: list[dict[str, Any]] = []
+    lines: list[str] = []
+    total_chars = 0
+
+    for file_key, file_errors in ranked_files[:max_files]:
+        seen: set[tuple[int, str]] = set()
+        chosen = 0
+        rel_file = _repo_relative_path(str(file_key), spring_repo)
+        ordered = sorted(
+            file_errors,
+            key=lambda e: (int(e.get("line", 0) or 0), str(e.get("message", "") or "")),
+        )
+        for e in ordered:
+            line_no = int(e.get("line", 0) or 0)
+            short_msg = _compact_error_message(
+                str(e.get("message", "") or ""), max_message_chars
+            )
+            sig = (line_no, short_msg)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            code = _message_code(short_msg)
+            diag = f"{rel_file}:{line_no}:{code}: {short_msg}"
+            if lines and total_chars + len(diag) + 1 > max_total_chars:
+                return compact_errors, lines
+            lines.append(diag)
+            total_chars += len(diag) + 1
+            compact_errors.append(
+                {
+                    "file": rel_file,
+                    "line": line_no,
+                    "message": short_msg,
+                    "code": code,
+                }
+            )
+            chosen += 1
+            if chosen >= max_errors_per_file:
+                break
+    return compact_errors, lines
 
 
 def call_cursor_agent(
@@ -2572,11 +2669,9 @@ def main() -> int:
                     # Replace code_e with only the unresolved errors for LLM dispatch
                     code_e = fix_result.unresolved
 
-                # 8.4: Fingerprint-based loop detection (replaces errors_history for v2)
+                # 8.4: Fingerprint-based loop detection (primary active memory in v2)
                 norm = normalize_errors(code_e + dep)
                 fps: list[list[str]] = list(le.get("error_fingerprints") or [])
-                # Also keep legacy errors_history for backward compat
-                hist: list[list[str]] = list(le.get("errors_history") or [])
 
                 # Check fingerprint match (stuck detection)
                 if fps and norm == fps[-1]:
@@ -2584,6 +2679,8 @@ def main() -> int:
                     if llm_calls_so_far >= gr.escalate_after_retries:
                         le["status"] = "failed"
                         le["failure_reason"] = "stuck"
+                        # Keep verbose error snapshots only for terminal failures.
+                        le["errors_history"] = [code_e[: gr.max_errors_llm]]
                         for sig in norm:
                             excluded_error_signatures.add(sig)
                         status["failed_layers"].append(
@@ -2594,9 +2691,10 @@ def main() -> int:
                         if args.fail_fast:
                             return 5
                         break
-                elif is_looping(norm, hist):
+                elif is_looping(norm, fps):
                     le["status"] = "loop_detected"
                     le["failure_reason"] = "loop_detected"
+                    le["errors_history"] = [code_e[: gr.max_errors_llm]]
                     for sig in norm:
                         excluded_error_signatures.add(sig)
                     status["failed_layers"].append(
@@ -2604,7 +2702,7 @@ def main() -> int:
                             "layer": label,
                             "reason": "loop_detected",
                             "last_errors_summary": norm[:20],
-                            "errors_history_tail": hist[-2:] if len(hist) >= 2 else hist,
+                            "errors_history_tail": fps[-2:] if len(fps) >= 2 else fps,
                         }
                     )
                     atomic_write_json(status_path, status)
@@ -2640,6 +2738,7 @@ def main() -> int:
                 if int(le.get("retry_count", 0)) >= gr.max_retries_per_layer:
                     le["status"] = "failed"
                     le["failure_reason"] = "max_retries"
+                    le["errors_history"] = [code_e[: gr.max_errors_llm]]
                     for sig in norm:
                         excluded_error_signatures.add(sig)
                     status["failed_layers"].append(
@@ -2679,12 +2778,6 @@ def main() -> int:
                     status["autonomous"]["last_errors_path"] = str(err_path)
                     atomic_write_json(status_path, status)
 
-                    batches = build_error_batches(
-                        llm_errors, gr.max_files_per_cursor_session
-                    )
-                    if not batches:
-                        batches = [llm_errors[: gr.max_errors_llm]]
-
                     fix_round = int(le.get("retry_count", 0))
                     attempt_model = (
                         gr.escalate_model
@@ -2692,70 +2785,88 @@ def main() -> int:
                         else gr.fix_model
                     )
 
-                    for batch in batches:
-                        top = batch[: gr.max_errors_llm]
-                        slice_hint = ""
-                        if path_prefix_arg is not None:
-                            slice_hint = (
-                                f'\nPlay ``app/`` path prefix for this slice: '
-                                f'"{path_prefix_arg or "(whole app)"}"'
-                            )
-                        # 8.3: Use PromptBuilder when available, fall back to inline prompt
-                        if _prompt_builder is not None and _clusterer is not None:
-                            clusters = _clusterer.cluster(top)
-                            prompt = _prompt_builder.fix_prompt(clusters, spring_repo)
-                        else:
-                            prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
-Errors (JSON, top {len(top)}):
-{json.dumps(top, indent=2)}
+                    # Token-efficient payload: one bounded prompt per retry by default.
+                    compact_errors, compact_lines = build_compact_llm_payload(
+                        errors=llm_errors,
+                        spring_repo=spring_repo,
+                        max_files=gr.max_files_per_cursor_session,
+                        max_errors_per_file=gr.max_errors_llm,
+                        max_message_chars=gr.max_error_message_chars,
+                        max_total_chars=gr.max_prompt_chars,
+                    )
+                    if not compact_errors:
+                        compact_errors = llm_errors[: gr.max_errors_llm]
+                        compact_lines = [
+                            f'{_repo_relative_path(str(e.get("file", "unknown")), spring_repo)}:'
+                            f'{int(e.get("line", 0) or 0)}:'
+                            f'{_compact_error_message(str(e.get("message", "") or ""), gr.max_error_message_chars)}'
+                            for e in compact_errors
+                        ]
+
+                    slice_hint = ""
+                    if path_prefix_arg is not None:
+                        slice_hint = f'\nPlay app path prefix: "{path_prefix_arg or "(whole app)"}"'
+                    # 8.3: Use PromptBuilder when available, fall back to compact inline prompt.
+                    if _prompt_builder is not None and _clusterer is not None:
+                        clusters = _clusterer.cluster(compact_errors)
+                        prompt = _prompt_builder.fix_prompt(clusters, spring_repo)
+                    else:
+                        prompt = f"""Fix Spring Boot compilation errors for migration slice "{label}".{slice_hint}
+Diagnostics (compact):
+{chr(10).join("- " + ln for ln in compact_lines)}
 {dep_hint}
 Rules:
 - Fix one error category at a time where possible.
 - Do not change public method signatures unless required to compile.
 - Touch at most {gr.max_files_per_fix} files in this attempt.
-- Only edit files under the Spring project; preserve business logic.
-- Cursor workspace root (Play + Spring visible): {cursor_workspace}
-- Spring repo root: {spring_repo}
-- Play repo (read originals if needed): {play_repo}
+- Only edit files under Spring src/main/java.
 """
-                        # 8.3: Pass system_prompt (sent once per session, cached by cursor-agent)
-                        _sys_prompt = _prompt_builder.system_prompt() if _prompt_builder is not None else None
-                        proc = call_cursor_agent(
-                            attempt_model,
-                            prompt,
-                            api_key,
-                            gr.cursor_agent_timeout_sec,
-                            args.dry_run,
-                            workspace=cursor_workspace,
-                            cwd=cursor_workspace,
-                            force=cursor_force,
-                            run_label=(
-                                f"compile-fix slice={label} model={attempt_model}"
-                            ),
-                            system_prompt=_sys_prompt,
+                    _sys_prompt = (
+                        _prompt_builder.system_prompt()
+                        if _prompt_builder is not None
+                        else (
+                            "You are a Java Spring Boot migration assistant. "
+                            "Edit only Spring src/main/java files and preserve business logic."
                         )
-                        if proc.returncode != 0:
-                            LOG.warning(
-                                "compile-fix cursor-agent failed rc=%s (see streamed lines above)",
-                                proc.returncode,
-                            )
-                        le["llm_calls"] = int(le.get("llm_calls", 0)) + 1
-                        status["autonomous"]["total_llm_calls"] = int(
-                            status["autonomous"]["total_llm_calls"]
-                        ) + 1
+                    )
+                    LOG.info(
+                        "compile-fix payload: slice=%s prompt_chars=%d diagnostics=%d files=%d llm_calls_round=1",
+                        label,
+                        len(prompt),
+                        len(compact_lines),
+                        len({e.get('file', 'unknown') for e in compact_errors}),
+                    )
+                    proc = call_cursor_agent(
+                        attempt_model,
+                        prompt,
+                        api_key,
+                        gr.cursor_agent_timeout_sec,
+                        args.dry_run,
+                        workspace=cursor_workspace,
+                        cwd=cursor_workspace,
+                        force=cursor_force,
+                        run_label=(
+                            f"compile-fix slice={label} model={attempt_model}"
+                        ),
+                        system_prompt=_sys_prompt,
+                    )
+                    if proc.returncode != 0:
+                        LOG.warning(
+                            "compile-fix cursor-agent failed rc=%s (see streamed lines above)",
+                            proc.returncode,
+                        )
+                    le["llm_calls"] = int(le.get("llm_calls", 0)) + 1
+                    status["autonomous"]["total_llm_calls"] = int(
+                        status["autonomous"]["total_llm_calls"]
+                    ) + 1
 
                     le["retry_count"] = int(le.get("retry_count", 0)) + 1
-                    hist.append(norm)
-                    le["errors_history"] = hist[-20:]
-                    # 8.4: update error_fingerprints ring buffer (last 5 rounds)
                     fps.append(norm)
                     le["error_fingerprints"] = fps[-5:]
                     atomic_write_json(status_path, status)
                 else:
                     # No cursor: no code changes; stuck detection uses compile_error_counts only
                     le["retry_count"] = int(le.get("retry_count", 0)) + 1
-                    hist.append(norm)
-                    le["errors_history"] = hist[-20:]
                     fps.append(norm)
                     le["error_fingerprints"] = fps[-5:]
                     atomic_write_json(status_path, status)
