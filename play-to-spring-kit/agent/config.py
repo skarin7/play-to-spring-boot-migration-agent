@@ -45,6 +45,9 @@ class AgentConfig:
     # Routes agent (M4)
     max_routes_attempts: int = 2
 
+    # Config-mapping agent (M4)
+    max_config_mapping_attempts: int = 2
+
     # LLM backend (OpenRouter / any OpenAI-compatible endpoint)
     base_url: str = field(
         default_factory=lambda: os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL)

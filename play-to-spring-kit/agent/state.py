@@ -119,6 +119,11 @@ class MigrationState(TypedDict, total=False):
     routes_attempts: int
     routes_decision: str  # "loop" | "noop" | "proceed" (routes_node's own routing signal)
 
+    # config mapping agent (M4)
+    config_map: dict[str, Any] | None
+    config_mapping_attempts: int
+    config_mapping_decision: str  # "loop" | "proceed" | "noop"
+
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)
 EXIT_OK = 0
