@@ -171,6 +171,22 @@ def _write_config_map(config: AgentConfig, seed_mapped: dict[str, str], leftover
     return config_map
 
 
+def _phase_budget_decision(
+    state: MigrationState, config: AgentConfig, attempts: int, max_attempts: int
+) -> str:
+    """Returns "budget_exhausted" | "attempts_exhausted" | "continue" — shared by every
+    bounded per-phase LLM loop (routes, config_mapping, and future phases). Global
+    budget is checked before the per-phase attempts cap: the global LLM budget is a
+    hard stop for the whole run, not just one phase, so it must be checked before
+    every agent call, not only via a phase-local attempts cap.
+    """
+    if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
+        return "budget_exhausted"
+    if attempts >= max_attempts:
+        return "attempts_exhausted"
+    return "continue"
+
+
 def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     ctx = ctx or default_ctx(config)
 
@@ -391,12 +407,11 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             route_map = _write_route_map(config, mapped, unmapped)
             return {"route_map": route_map, "routes_decision": "proceed"}
 
-        # Budget check mirrors guards.decide()'s ordering exactly (checked
-        # before per-slice retries there, before the per-phase attempt cap
-        # here): the global LLM budget is a hard stop for the whole run, not
-        # just this phase, so it must be checked before every agent call —
-        # not only via the routes-local max_routes_attempts cap.
-        if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
+        # Shared three-way decision (budget checked before the per-phase
+        # attempts cap — see _phase_budget_decision) used by every bounded
+        # per-phase LLM loop.
+        decision = _phase_budget_decision(state, config, attempts, config.max_routes_attempts)
+        if decision == "budget_exhausted":
             LOG.warning("routes: global LLM budget exhausted, aborting run")
             route_map = _write_route_map(config, mapped, unmapped)
             return {
@@ -404,8 +419,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
                 "run_outcome": "budget_exhausted",
                 "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
             }
-
-        if attempts >= config.max_routes_attempts:
+        if decision == "attempts_exhausted":
             LOG.warning("routes: giving up after %d attempts, %d routes still unmapped", attempts, len(unmapped))
             route_map = _write_route_map(config, mapped, unmapped)
             return {"route_map": route_map, "routes_decision": "proceed"}
@@ -525,11 +539,11 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             config_map = _write_config_map(config, cumulative_seed_mapped, {})
             return {"config_map": config_map, "config_mapping_decision": "proceed"}
 
-        # Budget check mirrors routes_node's ordering exactly: checked before
-        # the per-phase attempt cap and before invoking the agent, since the
-        # global LLM budget is a hard stop for the whole run, not just this
-        # phase.
-        if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
+        # Shared three-way decision (budget checked before the per-phase
+        # attempts cap — see _phase_budget_decision) used by every bounded
+        # per-phase LLM loop.
+        decision = _phase_budget_decision(state, config, attempts, config.max_config_mapping_attempts)
+        if decision == "budget_exhausted":
             LOG.warning("config_mapping: global LLM budget exhausted, aborting run")
             config_map = _write_config_map(config, cumulative_seed_mapped, leftover)
             return {
@@ -537,8 +551,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
                 "run_outcome": "budget_exhausted",
                 "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
             }
-
-        if attempts >= config.max_config_mapping_attempts:
+        if decision == "attempts_exhausted":
             LOG.warning(
                 "config_mapping: giving up after %d attempts, %d keys still unmapped", attempts, len(leftover)
             )
@@ -546,7 +559,15 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             return {"config_map": config_map, "config_mapping_decision": "proceed"}
 
         run_config_mapping_agent(config, leftover, attempt=attempts + 1, model_override=ctx.model_override)
+        # Persist config_map on the loop branch too (not just the terminal
+        # proceed/budget_exhausted paths) -- otherwise any seed_mapped keys
+        # applied this round are silently lost from the audit record once a
+        # later round's seed-diff comes up empty (they're already on disk,
+        # so no longer "new" to re-report), even though config_map.json's
+        # whole point is to be a complete cumulative record.
+        config_map = _write_config_map(config, cumulative_seed_mapped, leftover)
         return {
+            "config_map": config_map,
             "config_mapping_attempts": attempts + 1,
             "total_llm_calls": state.get("total_llm_calls", 0) + 1,
             "config_mapping_decision": "loop",
