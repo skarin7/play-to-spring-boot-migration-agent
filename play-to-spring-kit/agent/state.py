@@ -106,6 +106,12 @@ class MigrationState(TypedDict, total=False):
     bootstrap_attempts: int
     bootstrap_decision: str  # "skip" | "agent" | "retry" | "exhausted"
 
+    # routes agent (M4)
+    phase: str  # "slice" (default) | "routes_fix" — selects done/infra/halt routing target
+    route_map: dict[str, Any] | None
+    routes_attempts: int
+    routes_decision: str  # "loop" | "proceed" (routes_node's own routing signal)
+
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)
 EXIT_OK = 0

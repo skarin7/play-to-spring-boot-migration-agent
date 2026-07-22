@@ -1,23 +1,36 @@
 """Migration engine as a LangGraph state graph.
 
-Topology (M2 — slice pipeline wraps the M1 compile-fix loop):
+Topology (M4 — routes phase wraps the M1 compile-fix loop a second time,
+after the M2 slice pipeline finishes):
 
     START -> inventory -+-> slice_router -+-> transform -> compile -+-> slice_finalize
                         |  (no slices)     |  (all done)             |
-                        +-> run_halt(6)    +-> verify -+-> run_done   |
-                                                        +-> run_halt  |
+                        +-> run_halt(6)    +-> routes_node            |
+                                                                      |
                                           slice_router <---- slice_finalize (continue)
                                           run_halt <-------- slice_finalize (abort: budget/infra/no_llm)
 
-    compile -+-> done ----------------------> slice_finalize
-             +-> infra ---------------------> slice_finalize
+    routes_node -+-> routes_node        (self-loop: more unmapped routes, budget left)
+                 +-> routes_fix_prep -> compile   (re-enter compile-fix subgraph, phase=routes_fix)
+                 +-> verify                       (no play_repo / no conf/routes: no-op)
+
+    after_routes_fix -+-> verify    (phase reset to "slice"; non-blocking unless budget_exhausted)
+                       +-> run_halt (budget_exhausted only)
+
+    verify -+-> run_done
+            +-> run_halt
+
+    compile -+-> done ----------------------> slice_finalize | after_routes_fix (route_by_phase)
+             +-> infra ---------------------> slice_finalize | after_routes_fix (route_by_phase)
              +-> det_fix -+-> compile          (deterministic re-loop)
                           +-> cluster -> guard -+-> agent -> compile
-                                                +-> halt --> slice_finalize
+                                                +-> halt --> slice_finalize | after_routes_fix (route_by_phase)
 
 Determinism-first: the LLM agent is reached only after the deterministic
 fixers made no progress, and only if the guard (budget / retries / timeout /
-fingerprint loop detection) allows it.
+fingerprint loop detection) allows it. The compile-fix subgraph itself is
+phase-agnostic: `state["phase"]` ("slice" default | "routes_fix") only
+changes where done/infra/halt exit to (route_by_phase), never their own logic.
 
 Per-slice vs run-level state (legacy parity: migration_orchestrator.py's
 `for label, le, ... in entity_iterable` loop at :2500 vs. the `while True`
@@ -26,10 +39,15 @@ compile-fix loop nested inside it at :2530):
     excluded_error_signatures persist across the whole run.
   - retry_count, error_fingerprints, det_fix_log, last_compile, last_clusters,
     last_edited_files, slice_started_at, outcome, exit_code are reset by
-    slice_router each time it advances to a new unit.
+    slice_router each time it advances to a new unit, and again by
+    routes_fix_prep before the routes-fix compile-fix re-entry.
   - budget_exhausted / infrastructure_error / no_llm abort the whole run
     immediately; every other per-slice outcome just ends that slice and lets
     slice_router continue to the next unit (legacy: `return N` vs `break`).
+    Inside the routes-fix cycle only budget_exhausted aborts the run
+    (after_routes_fix); infra/no_llm there are non-blocking (logged, routes
+    mapping is best-effort, never gates the run — routes were never part of
+    the legacy tool's automated scope to begin with).
 """
 
 from __future__ import annotations
@@ -45,6 +63,7 @@ from langgraph.graph import END, START, StateGraph
 from . import guards, inventory, legacy_logic
 from .agents.bootstrap import run_bootstrap
 from .agents.compile_fix import run_compile_fix
+from .agents.routes import run_routes_agent
 from .config import AgentConfig
 from .state import (
     OUTCOME_EXIT_CODES,
@@ -53,6 +72,8 @@ from .state import (
     UNIT_TERMINAL_FAILURE_STATUSES,
     MigrationState,
 )
+from .status_v2 import atomic_write_json
+from .tools.routes_parser import diff_routes, find_spring_mappings, parse_routes_file
 
 LOG = logging.getLogger("agent.graph")
 
@@ -113,6 +134,12 @@ def _bootstrap_files_present(spring_repo: Path) -> tuple[bool, bool, bool]:
     app_ok = java_root.is_dir() and any(java_root.rglob("Application.java"))
     props_ok = (spring_repo / "src" / "main" / "resources" / "application.properties").is_file()
     return pom_ok, app_ok, props_ok
+
+
+def _write_route_map(config: AgentConfig, mapped: list[dict], unmapped: list[dict]) -> dict:
+    route_map = {"mapped": mapped, "unmapped": unmapped}
+    atomic_write_json(config.migration_dir / "route-map.json", route_map)
+    return route_map
 
 
 def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
@@ -235,7 +262,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     def route_after_slice_router(state: MigrationState) -> str:
         units = state.get("migration_units") or []
         idx = state.get("current_unit_idx", 0)
-        return "transform" if idx < len(units) else "verify"
+        return "transform" if idx < len(units) else "routes"
 
     def transform_node(state: MigrationState) -> dict:
         idx = state["current_unit_idx"]
@@ -310,6 +337,88 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
 
     def route_after_slice_finalize(state: MigrationState) -> str:
         return "halt" if state.get("run_outcome") else "router"
+
+    # ------------------------------------------------------------------
+    # Routes phase (M4) — runs once after the slice pipeline finishes,
+    # before the cross-module verify pass.
+    # ------------------------------------------------------------------
+
+    def routes_node(state: MigrationState) -> dict:
+        attempts = state.get("routes_attempts", 0)
+        if attempts == 0:
+            routes_file = (config.play_repo / "conf" / "routes") if config.play_repo is not None else None
+            if routes_file is None or not routes_file.is_file():
+                # Nothing to map (no Play repo, or no conf/routes) — no-op.
+                route_map = _write_route_map(config, [], [])
+                return {"route_map": route_map, "routes_decision": "noop"}
+
+        # Recompute unmapped fresh every round: the previous agent round may
+        # have mapped some (or all) of the previously-unmapped routes.
+        routes = parse_routes_file(config.play_repo / "conf" / "routes")
+        spring_mappings = find_spring_mappings(config.spring_repo)
+        mapped, unmapped = diff_routes(routes, spring_mappings)
+
+        if not unmapped:
+            route_map = _write_route_map(config, mapped, unmapped)
+            return {"route_map": route_map, "routes_decision": "proceed"}
+
+        if attempts >= config.max_routes_attempts:
+            LOG.warning("routes: giving up after %d attempts, %d routes still unmapped", attempts, len(unmapped))
+            route_map = _write_route_map(config, mapped, unmapped)
+            return {"route_map": route_map, "routes_decision": "proceed"}
+
+        run_routes_agent(config, unmapped, attempt=attempts + 1, model_override=ctx.model_override)
+        return {
+            "routes_attempts": attempts + 1,
+            "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+            "routes_decision": "loop",
+        }
+
+    def route_after_routes_node(state: MigrationState) -> str:
+        decision = state.get("routes_decision")
+        if decision == "loop":
+            return "routes"
+        if decision == "noop":
+            # No routes to map at all: skip the compile-fix re-entry entirely
+            # (routes_fix_prep would otherwise reset the current `outcome`,
+            # clobbering the slice pipeline's terminal outcome for no reason).
+            return "verify"
+        return "routes_fix_prep"
+
+    def routes_fix_prep_node(state: MigrationState) -> dict:
+        # Mirrors slice_router_node's per-slice reset dict exactly, plus the
+        # phase marker that retargets done/infra/halt to after_routes_fix.
+        return {
+            "retry_count": 0,
+            "error_fingerprints": [],
+            "det_fix_log": [],
+            "last_compile": {},
+            "last_clusters": [],
+            "last_edited_files": [],
+            "det_fixed_last_round": 0,
+            "slice_started_at": 0.0,
+            "guard_decision": None,
+            "outcome": None,
+            "exit_code": None,
+            "phase": "routes_fix",
+            "slice_id": "__routes__",
+        }
+
+    def after_routes_fix_node(state: MigrationState) -> dict:
+        outcome = state.get("outcome")
+        if outcome == "budget_exhausted":
+            # Legacy parity with slice_finalize_node's RUN_ABORTING_OUTCOMES
+            # handling: budget exhaustion aborts the whole run right here.
+            return {
+                "run_outcome": "budget_exhausted",
+                "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
+            }
+        if outcome != "success":
+            LOG.warning("routes-fix compile cycle ended with outcome=%s (non-blocking)", outcome)
+        return {"phase": "slice"}
+
+    def route_after_routes_fix(state: MigrationState) -> str:
+        return "halt" if state.get("run_outcome") else "verify"
 
     def verify_node(state: MigrationState) -> dict:
         # Cross-module full-compile verification pass (legacy parity:
@@ -504,6 +613,12 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         }.get(decision, "failed")
         return {"outcome": outcome, "exit_code": OUTCOME_EXIT_CODES[outcome]}
 
+    def route_by_phase(state: MigrationState) -> str:
+        # done/infra/halt exit the compile-fix subgraph to different places
+        # depending on which pipeline re-entered it (M2 slice loop vs the M4
+        # routes-fix re-entry) — the nodes themselves are unchanged.
+        return "slice_finalize" if state.get("phase", "slice") == "slice" else "after_routes_fix"
+
     # ------------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------------
@@ -518,6 +633,9 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("slice_router", slice_router_node)
     g.add_node("transform", transform_node)
     g.add_node("slice_finalize", slice_finalize_node)
+    g.add_node("routes", routes_node)
+    g.add_node("routes_fix_prep", routes_fix_prep_node)
+    g.add_node("after_routes_fix", after_routes_fix_node)
     g.add_node("verify", verify_node)
     g.add_node("run_done", run_done_node)
     g.add_node("run_halt", run_halt_node)
@@ -544,7 +662,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     )
 
     g.add_conditional_edges("inventory", route_after_inventory, {"router": "slice_router", "no_slices": "run_halt"})
-    g.add_conditional_edges("slice_router", route_after_slice_router, {"transform": "transform", "verify": "verify"})
+    g.add_conditional_edges("slice_router", route_after_slice_router, {"transform": "transform", "routes": "routes"})
     g.add_edge("transform", "compile")
 
     g.add_conditional_edges(
@@ -558,11 +676,25 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_edge("cluster", "guard")
     g.add_conditional_edges("guard", route_after_guard, {"agent": "agent", "halt": "halt"})
     g.add_edge("agent", "compile")
-    g.add_edge("done", "slice_finalize")
-    g.add_edge("infra", "slice_finalize")
-    g.add_edge("halt", "slice_finalize")
+    g.add_conditional_edges(
+        "done", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+    )
+    g.add_conditional_edges(
+        "infra", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+    )
+    g.add_conditional_edges(
+        "halt", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+    )
     g.add_conditional_edges(
         "slice_finalize", route_after_slice_finalize, {"router": "slice_router", "halt": "run_halt"}
+    )
+
+    g.add_conditional_edges(
+        "routes", route_after_routes_node, {"routes": "routes", "routes_fix_prep": "routes_fix_prep", "verify": "verify"}
+    )
+    g.add_edge("routes_fix_prep", "compile")
+    g.add_conditional_edges(
+        "after_routes_fix", route_after_routes_fix, {"halt": "run_halt", "verify": "verify"}
     )
 
     g.add_conditional_edges("verify", route_after_verify, {"done": "run_done", "halt": "run_halt"})
