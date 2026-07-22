@@ -68,6 +68,12 @@ def find_spring_mappings(spring_repo: Path) -> dict[str, set[str]]:
 
     Returns ``{"ClassName.methodName": {path, ...}}`` for every method that
     already has a route-mapping annotation with at least one literal path.
+
+    Class nesting is tracked with a brace-depth stack (not a full parser: it
+    assumes the common one-class-declaration-per-line, brace-on-same-line
+    style), so a nested ``static`` DTO class declared earlier in the file
+    doesn't shadow the enclosing controller class for methods declared after
+    it back at the outer level.
     """
     java_root = spring_repo / "src" / "main" / "java"
     mappings: dict[str, set[str]] = {}
@@ -76,11 +82,17 @@ def find_spring_mappings(spring_repo: Path) -> dict[str, set[str]]:
 
     for java_file in java_root.rglob("*.java"):
         lines = java_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        current_class: str | None = None
+        depth = 0
+        class_stack: list[tuple[int, str]] = []  # (brace_depth_of_body, name)
         for i, line in enumerate(lines):
+            depth += line.count("{") - line.count("}")
             class_match = CLASS_DECL_RE.search(line)
             if class_match:
-                current_class = class_match.group(1)
+                class_stack.append((depth, class_match.group(1)))
+            while class_stack and depth < class_stack[-1][0]:
+                class_stack.pop()
+            current_class = class_stack[-1][1] if class_stack else None
+
             if not MAPPING_ANNOTATION_RE.search(line):
                 continue
             paths = QUOTED_STRING_RE.findall(line)

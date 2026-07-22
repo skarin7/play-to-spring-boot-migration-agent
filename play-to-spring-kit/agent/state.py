@@ -106,11 +106,18 @@ class MigrationState(TypedDict, total=False):
     bootstrap_attempts: int
     bootstrap_decision: str  # "skip" | "agent" | "retry" | "exhausted"
 
+    # generic compile-fix re-entry (M4+): any phase that needs another pass
+    # through the shared compile-fix subgraph sets phase="fix_cycle" and
+    # fix_cycle_return_to to the node it wants control back at afterwards.
+    # done/infra/halt route on `phase` alone (route_by_phase); after_fix_cycle
+    # routes on `fix_cycle_return_to` alone — neither grows per phase.
+    phase: str  # "slice" (default) | "fix_cycle" — selects done/infra/halt routing target
+    fix_cycle_return_to: str  # node name after_fix_cycle proceeds to on non-fatal exit (e.g. "verify")
+
     # routes agent (M4)
-    phase: str  # "slice" (default) | "routes_fix" — selects done/infra/halt routing target
     route_map: dict[str, Any] | None
     routes_attempts: int
-    routes_decision: str  # "loop" | "proceed" (routes_node's own routing signal)
+    routes_decision: str  # "loop" | "noop" | "proceed" (routes_node's own routing signal)
 
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)

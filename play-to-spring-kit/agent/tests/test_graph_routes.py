@@ -203,6 +203,44 @@ def test_unmapped_routes_remain_after_max_attempts_is_non_blocking(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# 4b. Global LLM budget (max_total_llm_calls), not just max_routes_attempts,
+#     is a hard stop for routes_node too.
+# ----------------------------------------------------------------------
+
+
+def test_routes_node_respects_global_budget_zero_never_invokes_agent(tmp_path):
+    cfg = make_config(tmp_path, routes_text=ROUTES_TXT, max_total_llm_calls=0)
+    _write_controller(cfg.spring_repo, UNMAPPED_JAVA)
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), model_override=RaisingModel())
+    final = run(cfg, ctx)
+    assert final["run_outcome"] == "budget_exhausted"
+    assert final["run_exit_code"] == 4
+    assert final["total_llm_calls"] == 0
+    route_map = json.loads((cfg.migration_dir / "route-map.json").read_text())
+    assert len(route_map["unmapped"]) == 1
+
+
+def test_routes_node_stops_after_budget_exhausted_mid_loop(tmp_path):
+    """Regression: with max_total_llm_calls=1 and a model that never actually
+    maps the route, routes_node must make exactly 1 LLM call (not 2) and halt
+    with budget_exhausted, rather than looping past the global budget on the
+    strength of max_routes_attempts alone."""
+    cfg = make_config(tmp_path, routes_text=ROUTES_TXT, max_total_llm_calls=1, max_routes_attempts=5)
+    _write_controller(cfg.spring_repo, UNMAPPED_JAVA)
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    # Only one response queued: a second model.invoke() (i.e. a second LLM
+    # call past the budget) would raise IndexError and fail the test.
+    model = FakeToolModel([AIMessage(content="tried but gave up")])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), model_override=model)
+    final = run(cfg, ctx)
+    assert final["run_outcome"] == "budget_exhausted"
+    assert final["run_exit_code"] == 4
+    assert final["total_llm_calls"] == 1
+    assert final["routes_attempts"] == 1
+
+
+# ----------------------------------------------------------------------
 # 5. Routes-fix compile cycle: agent maps route, forced compile error routes
 #    through det_fix/cluster/guard/agent, terminates via after_routes_fix.
 # ----------------------------------------------------------------------
