@@ -14,7 +14,7 @@ from ..config import AgentConfig
 from ..state import RUN_OUTCOME_EXIT_CODES, MigrationState
 from ..status_v2 import atomic_write_json
 from ..tools.config_mapping import append_properties, diff_config_keys, flatten_play_conf, read_properties_keys
-from .common import _phase_budget_decision
+from .common import phase_budget_decision
 
 if TYPE_CHECKING:
     from ..graph import RuntimeCtx
@@ -86,9 +86,9 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             return {"config_map": config_map, "config_mapping_decision": "proceed"}
 
         # Shared three-way decision (budget checked before the per-phase
-        # attempts cap — see _phase_budget_decision) used by every bounded
+        # attempts cap — see phase_budget_decision) used by every bounded
         # per-phase LLM loop.
-        decision = _phase_budget_decision(state, config, attempts, config.max_config_mapping_attempts)
+        decision = phase_budget_decision(state, config, attempts, config.max_config_mapping_attempts)
         if decision == "budget_exhausted":
             LOG.warning("config_mapping: global LLM budget exhausted, aborting run")
             config_map = _write_config_map(config, cumulative_seed_mapped, leftover)

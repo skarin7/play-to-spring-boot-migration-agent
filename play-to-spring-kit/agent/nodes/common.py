@@ -1,6 +1,6 @@
 """Cross-phase shared mechanism for the generic fix-cycle re-entry pattern.
 
-`_phase_budget_decision` is the shared three-way decision used by every
+`phase_budget_decision` is the shared three-way decision used by every
 bounded per-phase LLM loop (routes, config_mapping, runtime_wiring, and any
 future phase). `route_by_phase` / `after_fix_cycle_node` / `route_after_fix_cycle`
 implement the generic "any phase can re-enter the M1 compile-fix subgraph and
@@ -21,7 +21,7 @@ from ..state import RUN_OUTCOME_EXIT_CODES, MigrationState
 LOG = logging.getLogger("agent.nodes.common")
 
 
-def _phase_budget_decision(
+def phase_budget_decision(
     state: MigrationState, config: AgentConfig, attempts: int, max_attempts: int
 ) -> str:
     """Returns "budget_exhausted" | "attempts_exhausted" | "continue" — shared by every

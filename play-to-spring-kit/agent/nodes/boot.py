@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Callable
 from ..agents.runtime_wiring import run_runtime_wiring_agent
 from ..config import AgentConfig
 from ..state import RUN_OUTCOME_EXIT_CODES, MigrationState
-from .common import _phase_budget_decision
+from .common import phase_budget_decision
 
 if TYPE_CHECKING:
     from ..graph import RuntimeCtx
@@ -43,7 +43,7 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
 
     def runtime_wiring_node(state: MigrationState) -> dict:
         attempts = state.get("runtime_wiring_attempts", 0)
-        decision = _phase_budget_decision(state, config, attempts, config.max_runtime_wiring_attempts)
+        decision = phase_budget_decision(state, config, attempts, config.max_runtime_wiring_attempts)
         if decision == "budget_exhausted":
             LOG.warning("runtime_wiring: global LLM budget exhausted, aborting run")
             return {
