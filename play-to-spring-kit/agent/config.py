@@ -48,6 +48,10 @@ class AgentConfig:
     # Config-mapping agent (M4)
     max_config_mapping_attempts: int = 2
 
+    # Runtime-wiring agent / boot verification (M4)
+    max_runtime_wiring_attempts: int = 6
+    boot_timeout_sec: int = 90
+
     # LLM backend (OpenRouter / any OpenAI-compatible endpoint)
     base_url: str = field(
         default_factory=lambda: os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL)

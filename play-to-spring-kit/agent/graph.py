@@ -23,8 +23,17 @@ mechanism any future phase can reuse — see the note below the diagram):
                      +-> verify          (no leftover / attempts exhausted / no conf-export to map)
                      +-> run_halt        (config_mapping itself hit the global LLM budget)
 
-    verify -+-> run_done
+    verify -+-> boot_run
             +-> run_halt
+
+    boot_run -+-> run_done                       (app started: "final_verification" is a routing
+                                                    label, not a node -- boot_started IS the check)
+              +-> runtime_wiring                  (app never printed the Spring Boot startup line)
+
+    runtime_wiring -+-> boot_run   (agent round done, re-check boot; always loops back)
+                     +-> run_halt  (own budget (6) or the global LLM budget exhausted: THIS phase's
+                                     failure genuinely fails the whole run -- unlike routes/config_mapping,
+                                     "the app never starts" is not a non-blocking outcome)
 
     compile -+-> done ----------------------> slice_finalize | after_fix_cycle (route_by_phase)
              +-> infra ---------------------> slice_finalize | after_fix_cycle (route_by_phase)
@@ -68,7 +77,12 @@ compile-fix loop nested inside it at :2530):
     legacy tool's automated scope to begin with). config_mapping is
     similarly best-effort and non-blocking (it only edits .properties
     values, so it never needs a fix-cycle re-entry of its own — it just
-    self-loops or gives up and proceeds straight to verify).
+    self-loops or gives up and proceeds straight to verify). runtime_wiring
+    (M4) is the one exception to "non-blocking": verify only proves the code
+    compiles, so boot_run actually starts the Spring app (agent/tools/maven.py)
+    and, if it never prints the startup line within its own budget of
+    attempts, run_halt with outcome="runtime_wiring_failed" — the plan
+    requires overall run success to gate on the app actually starting.
 """
 
 from __future__ import annotations
@@ -86,6 +100,7 @@ from .agents.bootstrap import run_bootstrap
 from .agents.compile_fix import run_compile_fix
 from .agents.config_mapping import run_config_mapping_agent
 from .agents.routes import run_routes_agent
+from .agents.runtime_wiring import run_runtime_wiring_agent
 from .config import AgentConfig
 from .state import (
     OUTCOME_EXIT_CODES,
@@ -96,6 +111,7 @@ from .state import (
 )
 from .status_v2 import atomic_write_json
 from .tools.config_mapping import append_properties, diff_config_keys, flatten_play_conf, read_properties_keys
+from .tools.maven import BootResult
 from .tools.routes_parser import diff_routes, find_spring_mappings, parse_routes_file
 
 LOG = logging.getLogger("agent.graph")
@@ -105,6 +121,7 @@ LOG_TAIL_CHARS = 2000
 FINGERPRINT_HISTORY = 5
 
 JarRunner = Callable[[AgentConfig, str], "tuple[int, int]"]
+BootRunner = Callable[[AgentConfig], BootResult]
 
 
 @dataclass
@@ -118,6 +135,7 @@ class RuntimeCtx:
     jar_runner: JarRunner | None = None
     setup_ops: Any = None
     bootstrap_model_override: Any = None
+    boot_runner: BootRunner | None = None
 
 
 def _default_jar_runner(config: AgentConfig, path_prefix: str) -> tuple[int, int]:
@@ -140,6 +158,7 @@ def default_ctx(config: AgentConfig) -> RuntimeCtx:
     from error_clusterer import ErrorClusterer
     from incremental_compiler import IncrementalCompiler
 
+    from .tools.maven import run_spring_boot
     from .tools.setup_ops import SetupOps
 
     return RuntimeCtx(
@@ -148,6 +167,7 @@ def default_ctx(config: AgentConfig) -> RuntimeCtx:
         clusterer=ErrorClusterer(),
         jar_runner=_default_jar_runner,
         setup_ops=SetupOps(),
+        boot_runner=lambda cfg: run_spring_boot(cfg.spring_repo, cfg.boot_timeout_sec, cfg.dry_run),
     )
 
 
@@ -605,7 +625,60 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     def route_after_verify(state: MigrationState) -> str:
         units = state.get("migration_units") or []
         failed = any(u.get("status") in UNIT_TERMINAL_FAILURE_STATUSES for u in units)
-        return "halt" if failed else "done"
+        return "halt" if failed else "boot_run"
+
+    # ------------------------------------------------------------------
+    # Runtime-wiring / boot-verification phase (M4) — the ONE new phase whose
+    # failure genuinely fails the whole run (see module docstring). Runs
+    # after verify (compile-only) succeeds: actually starts the Spring app
+    # and, if it never boots, invokes a bounded escalating-tier LLM agent to
+    # fix wiring/config issues and retries, up to config.max_runtime_wiring_attempts.
+    # ------------------------------------------------------------------
+
+    def boot_run_node(state: MigrationState) -> dict:
+        if ctx.boot_runner is None:
+            # No boot verification configured (every pre-M4-Task-3 test/caller
+            # never wires a boot_runner) — treat as trivially started, mirroring
+            # setup_node's `if ctx.setup_ops is None: return {}` skip-if-not-
+            # configured convention.
+            return {"boot_started": True, "boot_log_tail": ""}
+        result = ctx.boot_runner(config)
+        return {"boot_started": result.started, "boot_log_tail": result.log_tail}
+
+    def route_after_boot_run(state: MigrationState) -> str:
+        return "final_verification" if state.get("boot_started") else "runtime_wiring"
+
+    def runtime_wiring_node(state: MigrationState) -> dict:
+        attempts = state.get("runtime_wiring_attempts", 0)
+        decision = _phase_budget_decision(state, config, attempts, config.max_runtime_wiring_attempts)
+        if decision == "budget_exhausted":
+            LOG.warning("runtime_wiring: global LLM budget exhausted, aborting run")
+            return {
+                "run_outcome": "budget_exhausted",
+                "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
+            }
+        if decision == "attempts_exhausted":
+            LOG.warning("runtime_wiring: giving up after %d attempts, app never started", attempts)
+            return {
+                "run_outcome": "runtime_wiring_failed",
+                "run_exit_code": RUN_OUTCOME_EXIT_CODES["runtime_wiring_failed"],
+            }
+        if not config.api_key:
+            # Mirrors guard_node's "no_llm" check (agent/guards.py) for the M1
+            # compile-fix subgraph: never let a missing API key crash the run
+            # via make_model — degrade to a terminal outcome instead.
+            LOG.warning("runtime_wiring: no API key configured, cannot invoke agent")
+            return {"run_outcome": "no_llm", "run_exit_code": RUN_OUTCOME_EXIT_CODES["no_llm"]}
+        run_runtime_wiring_agent(
+            config, state.get("boot_log_tail", ""), attempt=attempts + 1, model_override=ctx.model_override
+        )
+        return {
+            "runtime_wiring_attempts": attempts + 1,
+            "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+        }
+
+    def route_after_runtime_wiring_node(state: MigrationState) -> str:
+        return "halt" if state.get("run_outcome") else "boot_run"
 
     def run_done_node(state: MigrationState) -> dict:
         return {"run_outcome": "success", "run_exit_code": RUN_OUTCOME_EXIT_CODES["success"]}
@@ -805,6 +878,8 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("after_fix_cycle", after_fix_cycle_node)
     g.add_node("config_mapping", config_mapping_node)
     g.add_node("verify", verify_node)
+    g.add_node("boot_run", boot_run_node)
+    g.add_node("runtime_wiring", runtime_wiring_node)
     g.add_node("run_done", run_done_node)
     g.add_node("run_halt", run_halt_node)
 
@@ -880,7 +955,15 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         {"config_mapping": "config_mapping", "verify": "verify", "halt": "run_halt"},
     )
 
-    g.add_conditional_edges("verify", route_after_verify, {"done": "run_done", "halt": "run_halt"})
+    g.add_conditional_edges("verify", route_after_verify, {"halt": "run_halt", "boot_run": "boot_run"})
+    g.add_conditional_edges(
+        "boot_run",
+        route_after_boot_run,
+        {"final_verification": "run_done", "runtime_wiring": "runtime_wiring"},
+    )
+    g.add_conditional_edges(
+        "runtime_wiring", route_after_runtime_wiring_node, {"halt": "run_halt", "boot_run": "boot_run"}
+    )
     g.add_edge("run_done", END)
     g.add_edge("run_halt", END)
     return g

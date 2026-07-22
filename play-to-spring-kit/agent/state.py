@@ -124,6 +124,11 @@ class MigrationState(TypedDict, total=False):
     config_mapping_attempts: int
     config_mapping_decision: str  # "loop" | "proceed" | "noop"
 
+    # runtime wiring / boot verification (M4)
+    boot_started: bool
+    boot_log_tail: str
+    runtime_wiring_attempts: int
+
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)
 EXIT_OK = 0
@@ -154,4 +159,5 @@ RUN_OUTCOME_EXIT_CODES: dict[str, int] = {
     "no_slices": EXIT_NO_SLICES,
     "setup_failed": 1,  # generic setup failure (jar build / setup.sh) — legacy parity: `return 1`
     "init_failed": EXIT_INIT_NOT_DONE,
+    "runtime_wiring_failed": EXIT_SLICE_FAILURE,  # app never booted; same "manual intervention" bucket
 }
