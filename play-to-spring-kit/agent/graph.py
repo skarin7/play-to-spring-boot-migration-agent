@@ -1,7 +1,8 @@
 """Migration engine as a LangGraph state graph.
 
 Topology (M4 — routes phase wraps the M1 compile-fix loop a second time,
-after the M2 slice pipeline finishes):
+after the M2 slice pipeline finishes, via a generic "fix cycle" re-entry
+mechanism any future phase can reuse — see the note below the diagram):
 
     START -> inventory -+-> slice_router -+-> transform -> compile -+-> slice_finalize
                         |  (no slices)     |  (all done)             |
@@ -11,26 +12,39 @@ after the M2 slice pipeline finishes):
                                           run_halt <-------- slice_finalize (abort: budget/infra/no_llm)
 
     routes_node -+-> routes_node        (self-loop: more unmapped routes, budget left)
-                 +-> routes_fix_prep -> compile   (re-enter compile-fix subgraph, phase=routes_fix)
+                 +-> routes_fix_prep -> compile   (re-enter compile-fix subgraph, phase=fix_cycle)
                  +-> verify                       (no play_repo / no conf/routes: no-op)
+                 +-> run_halt                      (routes_node itself hit the global LLM budget)
 
-    after_routes_fix -+-> verify    (phase reset to "slice"; non-blocking unless budget_exhausted)
-                       +-> run_halt (budget_exhausted only)
+    after_fix_cycle -+-> <fix_cycle_return_to>  (phase reset to "slice"; non-blocking unless budget_exhausted)
+                      +-> run_halt               (budget_exhausted only)
 
     verify -+-> run_done
             +-> run_halt
 
-    compile -+-> done ----------------------> slice_finalize | after_routes_fix (route_by_phase)
-             +-> infra ---------------------> slice_finalize | after_routes_fix (route_by_phase)
+    compile -+-> done ----------------------> slice_finalize | after_fix_cycle (route_by_phase)
+             +-> infra ---------------------> slice_finalize | after_fix_cycle (route_by_phase)
              +-> det_fix -+-> compile          (deterministic re-loop)
                           +-> cluster -> guard -+-> agent -> compile
-                                                +-> halt --> slice_finalize | after_routes_fix (route_by_phase)
+                                                +-> halt --> slice_finalize | after_fix_cycle (route_by_phase)
 
 Determinism-first: the LLM agent is reached only after the deterministic
 fixers made no progress, and only if the guard (budget / retries / timeout /
 fingerprint loop detection) allows it. The compile-fix subgraph itself is
-phase-agnostic: `state["phase"]` ("slice" default | "routes_fix") only
-changes where done/infra/halt exit to (route_by_phase), never their own logic.
+phase-agnostic: `state["phase"]` ("slice" default | "fix_cycle") only changes
+where done/infra/halt exit to (route_by_phase), never their own logic.
+
+Generic fix-cycle re-entry (any phase, not just routes, that needs to make
+edits and then re-verify via the shared compile-fix subgraph): a phase's own
+"<phase>_fix_prep" node (e.g. routes_fix_prep) sets phase="fix_cycle" and
+fix_cycle_return_to="<node to resume at>", then edges to "compile". When the
+subgraph terminates (done/infra/halt), route_by_phase sends it to the single
+generic after_fix_cycle node, which aborts the whole run on
+outcome=="budget_exhausted" (legacy RUN_ABORTING_OUTCOMES parity) or
+otherwise resets phase back to "slice" and hands control to whatever
+fix_cycle_return_to says (route_after_fix_cycle) — every possible
+fix_cycle_return_to target must be enumerated once in that edge's mapping
+dict, but no new node or router is needed per phase.
 
 Per-slice vs run-level state (legacy parity: migration_orchestrator.py's
 `for label, le, ... in entity_iterable` loop at :2500 vs. the `while True`
@@ -39,15 +53,15 @@ compile-fix loop nested inside it at :2530):
     excluded_error_signatures persist across the whole run.
   - retry_count, error_fingerprints, det_fix_log, last_compile, last_clusters,
     last_edited_files, slice_started_at, outcome, exit_code are reset by
-    slice_router each time it advances to a new unit, and again by
-    routes_fix_prep before the routes-fix compile-fix re-entry.
+    slice_router each time it advances to a new unit, and again by any
+    "<phase>_fix_prep" node before its fix-cycle re-entry.
   - budget_exhausted / infrastructure_error / no_llm abort the whole run
     immediately; every other per-slice outcome just ends that slice and lets
     slice_router continue to the next unit (legacy: `return N` vs `break`).
-    Inside the routes-fix cycle only budget_exhausted aborts the run
-    (after_routes_fix); infra/no_llm there are non-blocking (logged, routes
-    mapping is best-effort, never gates the run — routes were never part of
-    the legacy tool's automated scope to begin with).
+    Inside a fix cycle only budget_exhausted aborts the run (after_fix_cycle);
+    infra/no_llm there are non-blocking (logged; e.g. routes mapping is
+    best-effort and never gates the run — routes were never part of the
+    legacy tool's automated scope to begin with).
 """
 
 from __future__ import annotations
@@ -362,6 +376,20 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             route_map = _write_route_map(config, mapped, unmapped)
             return {"route_map": route_map, "routes_decision": "proceed"}
 
+        # Budget check mirrors guards.decide()'s ordering exactly (checked
+        # before per-slice retries there, before the per-phase attempt cap
+        # here): the global LLM budget is a hard stop for the whole run, not
+        # just this phase, so it must be checked before every agent call —
+        # not only via the routes-local max_routes_attempts cap.
+        if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
+            LOG.warning("routes: global LLM budget exhausted, aborting run")
+            route_map = _write_route_map(config, mapped, unmapped)
+            return {
+                "route_map": route_map,
+                "run_outcome": "budget_exhausted",
+                "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
+            }
+
         if attempts >= config.max_routes_attempts:
             LOG.warning("routes: giving up after %d attempts, %d routes still unmapped", attempts, len(unmapped))
             route_map = _write_route_map(config, mapped, unmapped)
@@ -375,6 +403,8 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         }
 
     def route_after_routes_node(state: MigrationState) -> str:
+        if state.get("run_outcome"):
+            return "halt"
         decision = state.get("routes_decision")
         if decision == "loop":
             return "routes"
@@ -387,7 +417,13 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
 
     def routes_fix_prep_node(state: MigrationState) -> dict:
         # Mirrors slice_router_node's per-slice reset dict exactly, plus the
-        # phase marker that retargets done/infra/halt to after_routes_fix.
+        # generic fix-cycle markers (phase / fix_cycle_return_to) that
+        # retarget done/infra/halt to after_fix_cycle and tell it where to
+        # hand control back once the cycle ends non-fatally. Any future
+        # phase that needs the same "re-enter compile-fix, then come back"
+        # pattern adds its own <phase>_fix_prep node setting the same two
+        # generic fields — after_fix_cycle/route_after_fix_cycle need no
+        # per-phase changes.
         return {
             "retry_count": 0,
             "error_fingerprints": [],
@@ -400,11 +436,12 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             "guard_decision": None,
             "outcome": None,
             "exit_code": None,
-            "phase": "routes_fix",
+            "phase": "fix_cycle",
+            "fix_cycle_return_to": "verify",
             "slice_id": "__routes__",
         }
 
-    def after_routes_fix_node(state: MigrationState) -> dict:
+    def after_fix_cycle_node(state: MigrationState) -> dict:
         outcome = state.get("outcome")
         if outcome == "budget_exhausted":
             # Legacy parity with slice_finalize_node's RUN_ABORTING_OUTCOMES
@@ -414,11 +451,13 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
                 "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
             }
         if outcome != "success":
-            LOG.warning("routes-fix compile cycle ended with outcome=%s (non-blocking)", outcome)
+            LOG.warning("fix cycle ended with outcome=%s (non-blocking)", outcome)
         return {"phase": "slice"}
 
-    def route_after_routes_fix(state: MigrationState) -> str:
-        return "halt" if state.get("run_outcome") else "verify"
+    def route_after_fix_cycle(state: MigrationState) -> str:
+        if state.get("run_outcome"):
+            return "halt"
+        return state["fix_cycle_return_to"]
 
     def verify_node(state: MigrationState) -> dict:
         # Cross-module full-compile verification pass (legacy parity:
@@ -615,9 +654,12 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
 
     def route_by_phase(state: MigrationState) -> str:
         # done/infra/halt exit the compile-fix subgraph to different places
-        # depending on which pipeline re-entered it (M2 slice loop vs the M4
-        # routes-fix re-entry) — the nodes themselves are unchanged.
-        return "slice_finalize" if state.get("phase", "slice") == "slice" else "after_routes_fix"
+        # depending on which pipeline re-entered it (M2 slice loop vs any
+        # phase's fix-cycle re-entry) — the nodes themselves are unchanged.
+        # Always a plain two-way check regardless of how many phases exist:
+        # after_fix_cycle is the single generic landing node for all of them
+        # (see route_after_fix_cycle for the per-phase return-to routing).
+        return "slice_finalize" if state.get("phase", "slice") == "slice" else "after_fix_cycle"
 
     # ------------------------------------------------------------------
     # Wiring
@@ -635,7 +677,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("slice_finalize", slice_finalize_node)
     g.add_node("routes", routes_node)
     g.add_node("routes_fix_prep", routes_fix_prep_node)
-    g.add_node("after_routes_fix", after_routes_fix_node)
+    g.add_node("after_fix_cycle", after_fix_cycle_node)
     g.add_node("verify", verify_node)
     g.add_node("run_done", run_done_node)
     g.add_node("run_halt", run_halt_node)
@@ -677,24 +719,29 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_conditional_edges("guard", route_after_guard, {"agent": "agent", "halt": "halt"})
     g.add_edge("agent", "compile")
     g.add_conditional_edges(
-        "done", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+        "done", route_by_phase, {"slice_finalize": "slice_finalize", "after_fix_cycle": "after_fix_cycle"}
     )
     g.add_conditional_edges(
-        "infra", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+        "infra", route_by_phase, {"slice_finalize": "slice_finalize", "after_fix_cycle": "after_fix_cycle"}
     )
     g.add_conditional_edges(
-        "halt", route_by_phase, {"slice_finalize": "slice_finalize", "after_routes_fix": "after_routes_fix"}
+        "halt", route_by_phase, {"slice_finalize": "slice_finalize", "after_fix_cycle": "after_fix_cycle"}
     )
     g.add_conditional_edges(
         "slice_finalize", route_after_slice_finalize, {"router": "slice_router", "halt": "run_halt"}
     )
 
     g.add_conditional_edges(
-        "routes", route_after_routes_node, {"routes": "routes", "routes_fix_prep": "routes_fix_prep", "verify": "verify"}
+        "routes",
+        route_after_routes_node,
+        {"routes": "routes", "routes_fix_prep": "routes_fix_prep", "verify": "verify", "halt": "run_halt"},
     )
     g.add_edge("routes_fix_prep", "compile")
+    # Every phase's fix_cycle_return_to value must be enumerated here (one
+    # line per future phase, in this one place) — LangGraph needs the full
+    # destination set upfront.
     g.add_conditional_edges(
-        "after_routes_fix", route_after_routes_fix, {"halt": "run_halt", "verify": "verify"}
+        "after_fix_cycle", route_after_fix_cycle, {"halt": "run_halt", "verify": "verify"}
     )
 
     g.add_conditional_edges("verify", route_after_verify, {"done": "run_done", "halt": "run_halt"})

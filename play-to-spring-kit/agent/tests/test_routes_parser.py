@@ -85,6 +85,39 @@ def test_find_spring_mappings_scans_annotations(tmp_path):
     assert "UserController.create" not in mappings
 
 
+NESTED_CLASS_JAVA = """\
+package controllers;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class UserController {
+
+    public static class CreateRequest {
+        public String name;
+    }
+
+    @GetMapping("/users")
+    public ResponseEntity<List<User>> list() {
+        return null;
+    }
+}
+"""
+
+
+def test_find_spring_mappings_attributes_nested_class_method_to_outer_class(tmp_path):
+    """Regression: a nested static DTO class declared before an annotated
+    method must not shadow the enclosing controller class in the mapping key."""
+    spring_repo = tmp_path / "spring"
+    java_dir = spring_repo / "src" / "main" / "java" / "controllers"
+    java_dir.mkdir(parents=True)
+    (java_dir / "UserController.java").write_text(NESTED_CLASS_JAVA, encoding="utf-8")
+
+    mappings = find_spring_mappings(spring_repo)
+    assert mappings["UserController.list"] == {"/users"}
+    assert "CreateRequest.list" not in mappings
+
+
 def test_diff_routes_splits_mapped_and_unmapped(tmp_path):
     routes_path = tmp_path / "routes"
     routes_path.write_text(ROUTES_TXT, encoding="utf-8")
