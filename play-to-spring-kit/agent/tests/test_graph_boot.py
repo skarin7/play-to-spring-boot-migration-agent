@@ -10,7 +10,7 @@ graph.invoke(...), plus a FakeBootRunner standing in for ctx.boot_runner.
 
 from agent.config import AgentConfig
 from agent.graph import RuntimeCtx, build_graph, recursion_limit
-from agent.state import EXIT_OK
+from agent.state import EXIT_OK, EXIT_STUCK_NO_LLM
 from agent.tests.test_graph_flow import (
     FakeCompileResult,
     FakeCompiler,
@@ -158,6 +158,35 @@ def test_boot_never_succeeds_run_fails_blocking(tmp_path):
     assert final["runtime_wiring_attempts"] == 2
     assert final["total_llm_calls"] == 2
     assert boot_runner.calls == 3
+
+
+# ----------------------------------------------------------------------
+# 4b. No API key configured: runtime_wiring_node must degrade to a terminal
+#     "no_llm" outcome (mirroring guard_node's equivalent check) rather than
+#     crashing make_model -- this is what keeps test_integration_mvn.py's
+#     real-mvn tests green, but neither of those tests actually asserts
+#     run_outcome/run_exit_code (they check the earlier, stale per-slice
+#     outcome/exit_code instead), so assert the exact shape here directly.
+# ----------------------------------------------------------------------
+
+
+def test_boot_fails_with_no_api_key_degrades_to_no_llm(tmp_path):
+    cfg = make_config(tmp_path)
+    cfg.api_key = None
+    boot_runner = FakeBootRunner([BootResult(started=False, log_tail="NoSuchBeanDefinitionException")])
+    ctx = RuntimeCtx(
+        FakeCompiler([FakeCompileResult(0)]),
+        FakeFixer(),
+        _real_clusterer(),
+        model_override=RaisingModel(),
+        boot_runner=boot_runner,
+    )
+    final = run(cfg, ctx)
+    assert final["run_outcome"] == "no_llm"
+    assert final["run_exit_code"] == EXIT_STUCK_NO_LLM
+    assert final.get("runtime_wiring_attempts", 0) == 0
+    assert final["total_llm_calls"] == 0
+    assert boot_runner.calls == 1
 
 
 # ----------------------------------------------------------------------
