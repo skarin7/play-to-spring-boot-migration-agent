@@ -13,11 +13,15 @@ mechanism any future phase can reuse — see the note below the diagram):
 
     routes_node -+-> routes_node        (self-loop: more unmapped routes, budget left)
                  +-> routes_fix_prep -> compile   (re-enter compile-fix subgraph, phase=fix_cycle)
-                 +-> verify                       (no play_repo / no conf/routes: no-op)
+                 +-> config_mapping                (no play_repo / no conf/routes: no-op)
                  +-> run_halt                      (routes_node itself hit the global LLM budget)
 
     after_fix_cycle -+-> <fix_cycle_return_to>  (phase reset to "slice"; non-blocking unless budget_exhausted)
                       +-> run_halt               (budget_exhausted only)
+
+    config_mapping -+-> config_mapping  (self-loop: leftover config keys, budget left)
+                     +-> verify          (no leftover / attempts exhausted / no conf-export to map)
+                     +-> run_halt        (config_mapping itself hit the global LLM budget)
 
     verify -+-> run_done
             +-> run_halt
@@ -61,7 +65,10 @@ compile-fix loop nested inside it at :2530):
     Inside a fix cycle only budget_exhausted aborts the run (after_fix_cycle);
     infra/no_llm there are non-blocking (logged; e.g. routes mapping is
     best-effort and never gates the run — routes were never part of the
-    legacy tool's automated scope to begin with).
+    legacy tool's automated scope to begin with). config_mapping is
+    similarly best-effort and non-blocking (it only edits .properties
+    values, so it never needs a fix-cycle re-entry of its own — it just
+    self-loops or gives up and proceeds straight to verify).
 """
 
 from __future__ import annotations
@@ -77,6 +84,7 @@ from langgraph.graph import END, START, StateGraph
 from . import guards, inventory, legacy_logic
 from .agents.bootstrap import run_bootstrap
 from .agents.compile_fix import run_compile_fix
+from .agents.config_mapping import run_config_mapping_agent
 from .agents.routes import run_routes_agent
 from .config import AgentConfig
 from .state import (
@@ -87,6 +95,7 @@ from .state import (
     MigrationState,
 )
 from .status_v2 import atomic_write_json
+from .tools.config_mapping import append_properties, diff_config_keys, flatten_play_conf, read_properties_keys
 from .tools.routes_parser import diff_routes, find_spring_mappings, parse_routes_file
 
 LOG = logging.getLogger("agent.graph")
@@ -154,6 +163,12 @@ def _write_route_map(config: AgentConfig, mapped: list[dict], unmapped: list[dic
     route_map = {"mapped": mapped, "unmapped": unmapped}
     atomic_write_json(config.migration_dir / "route-map.json", route_map)
     return route_map
+
+
+def _write_config_map(config: AgentConfig, seed_mapped: dict[str, str], leftover: dict[str, str]) -> dict:
+    config_map = {"seed_mapped": seed_mapped, "leftover": leftover}
+    atomic_write_json(config.migration_dir / "config-map.json", config_map)
+    return config_map
 
 
 def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
@@ -412,7 +427,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             # No routes to map at all: skip the compile-fix re-entry entirely
             # (routes_fix_prep would otherwise reset the current `outcome`,
             # clobbering the slice pipeline's terminal outcome for no reason).
-            return "verify"
+            return "config_mapping"
         return "routes_fix_prep"
 
     def routes_fix_prep_node(state: MigrationState) -> dict:
@@ -437,7 +452,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
             "outcome": None,
             "exit_code": None,
             "phase": "fix_cycle",
-            "fix_cycle_return_to": "verify",
+            "fix_cycle_return_to": "config_mapping",
             "slice_id": "__routes__",
         }
 
@@ -458,6 +473,95 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         if state.get("run_outcome"):
             return "halt"
         return state["fix_cycle_return_to"]
+
+    # ------------------------------------------------------------------
+    # Config-mapping phase (M4) — runs after the routes phase, before the
+    # cross-module verify pass. Editing .properties values can never break
+    # `mvn compile`, so unlike routes this phase never needs to re-enter the
+    # compile-fix subgraph: it only self-loops or hands off to verify.
+    # ------------------------------------------------------------------
+
+    def config_mapping_node(state: MigrationState) -> dict:
+        attempts = state.get("config_mapping_attempts", 0)
+        properties_path = config.spring_repo / "src" / "main" / "resources" / "application.properties"
+        conf_path = (config.play_repo / "conf" / "application.conf") if config.play_repo is not None else None
+
+        if attempts == 0:
+            if (
+                config.play_repo is None
+                or not config.export_play_conf
+                or conf_path is None
+                or not conf_path.is_file()
+                or not properties_path.is_file()
+            ):
+                # Nothing to map (no Play repo, conf export disabled, no
+                # conf/application.conf, or the export never produced a
+                # properties file to begin with) — no-op.
+                config_map = _write_config_map(config, {}, {})
+                return {"config_map": config_map, "config_mapping_decision": "noop"}
+
+        # Recompute fresh every round: a previous agent round may have
+        # resolved some (or all) of the previously-leftover keys, and the
+        # seed pass below may append new canonical keys this round too.
+        flattened = flatten_play_conf(conf_path)
+        existing_keys = read_properties_keys(properties_path)
+        seed_mapped, leftover = diff_config_keys(flattened, existing_keys)
+
+        # Deterministic pass first, every round, regardless of attempts/budget
+        # (zero LLM cost — same "determinism first" principle used throughout
+        # this codebase; never gate this behind the agent or the attempts cap).
+        if seed_mapped:
+            append_properties(properties_path, seed_mapped)
+
+        # Cumulative seed_mapped across rounds: each round's diff only
+        # reflects keys not yet appended, so merge with what earlier rounds
+        # already wrote to keep config-map.json a complete record. `leftover`
+        # is always just this round's fresh diff (an agent round may have
+        # resolved some of it already).
+        cumulative_seed_mapped = dict((state.get("config_map") or {}).get("seed_mapped") or {})
+        cumulative_seed_mapped.update(seed_mapped)
+
+        if not leftover:
+            config_map = _write_config_map(config, cumulative_seed_mapped, {})
+            return {"config_map": config_map, "config_mapping_decision": "proceed"}
+
+        # Budget check mirrors routes_node's ordering exactly: checked before
+        # the per-phase attempt cap and before invoking the agent, since the
+        # global LLM budget is a hard stop for the whole run, not just this
+        # phase.
+        if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
+            LOG.warning("config_mapping: global LLM budget exhausted, aborting run")
+            config_map = _write_config_map(config, cumulative_seed_mapped, leftover)
+            return {
+                "config_map": config_map,
+                "run_outcome": "budget_exhausted",
+                "run_exit_code": RUN_OUTCOME_EXIT_CODES["budget_exhausted"],
+            }
+
+        if attempts >= config.max_config_mapping_attempts:
+            LOG.warning(
+                "config_mapping: giving up after %d attempts, %d keys still unmapped", attempts, len(leftover)
+            )
+            config_map = _write_config_map(config, cumulative_seed_mapped, leftover)
+            return {"config_map": config_map, "config_mapping_decision": "proceed"}
+
+        run_config_mapping_agent(config, leftover, attempt=attempts + 1, model_override=ctx.model_override)
+        return {
+            "config_mapping_attempts": attempts + 1,
+            "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+            "config_mapping_decision": "loop",
+        }
+
+    def route_after_config_mapping_node(state: MigrationState) -> str:
+        if state.get("run_outcome"):
+            return "halt"
+        decision = state.get("config_mapping_decision")
+        if decision == "loop":
+            return "config_mapping"
+        # Both "proceed" and "noop" land on verify — there's no routes-style
+        # noop/proceed distinction needed downstream since config_mapping has
+        # no fix-cycle to skip.
+        return "verify"
 
     def verify_node(state: MigrationState) -> dict:
         # Cross-module full-compile verification pass (legacy parity:
@@ -678,6 +782,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("routes", routes_node)
     g.add_node("routes_fix_prep", routes_fix_prep_node)
     g.add_node("after_fix_cycle", after_fix_cycle_node)
+    g.add_node("config_mapping", config_mapping_node)
     g.add_node("verify", verify_node)
     g.add_node("run_done", run_done_node)
     g.add_node("run_halt", run_halt_node)
@@ -734,14 +839,24 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_conditional_edges(
         "routes",
         route_after_routes_node,
-        {"routes": "routes", "routes_fix_prep": "routes_fix_prep", "verify": "verify", "halt": "run_halt"},
+        {
+            "routes": "routes",
+            "routes_fix_prep": "routes_fix_prep",
+            "config_mapping": "config_mapping",
+            "halt": "run_halt",
+        },
     )
     g.add_edge("routes_fix_prep", "compile")
     # Every phase's fix_cycle_return_to value must be enumerated here (one
     # line per future phase, in this one place) — LangGraph needs the full
     # destination set upfront.
     g.add_conditional_edges(
-        "after_fix_cycle", route_after_fix_cycle, {"halt": "run_halt", "verify": "verify"}
+        "after_fix_cycle", route_after_fix_cycle, {"halt": "run_halt", "config_mapping": "config_mapping"}
+    )
+    g.add_conditional_edges(
+        "config_mapping",
+        route_after_config_mapping_node,
+        {"config_mapping": "config_mapping", "verify": "verify", "halt": "run_halt"},
     )
 
     g.add_conditional_edges("verify", route_after_verify, {"done": "run_done", "halt": "run_halt"})
