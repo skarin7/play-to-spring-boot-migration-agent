@@ -12,7 +12,7 @@ from ..config import AgentConfig
 from ..state import RUN_OUTCOME_EXIT_CODES, MigrationState
 from ..status_v2 import atomic_write_json
 from ..tools.routes_parser import diff_routes, find_spring_mappings, parse_routes_file
-from .common import _phase_budget_decision
+from .common import phase_budget_decision
 
 if TYPE_CHECKING:
     from ..graph import RuntimeCtx
@@ -88,9 +88,9 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             return {"route_map": route_map, "routes_decision": "proceed"}
 
         # Shared three-way decision (budget checked before the per-phase
-        # attempts cap — see _phase_budget_decision) used by every bounded
+        # attempts cap — see phase_budget_decision) used by every bounded
         # per-phase LLM loop.
-        decision = _phase_budget_decision(state, config, attempts, config.max_routes_attempts)
+        decision = phase_budget_decision(state, config, attempts, config.max_routes_attempts)
         if decision == "budget_exhausted":
             LOG.warning("routes: global LLM budget exhausted, aborting run")
             route_map = _write_route_map(config, mapped, unmapped)
