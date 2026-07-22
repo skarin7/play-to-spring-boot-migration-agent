@@ -275,6 +275,39 @@ def test_unknown_key_remains_after_max_attempts_is_non_blocking(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# 4b. Regression: a seed-mapped key applied on an earlier loop round must
+#     not be lost from config-map.json's audit record just because a later
+#     round's own diff for it comes up empty (already on disk) while a
+#     separate leftover key keeps forcing more loop rounds.
+# ----------------------------------------------------------------------
+
+
+def test_seed_mapped_persists_across_loop_rounds_not_lost(tmp_path):
+    conf_text = SEED_CONF_TXT + LEFTOVER_CONF_TXT
+    cfg = make_config(tmp_path, conf_text=conf_text, max_config_mapping_attempts=2)
+    compiler = FakeCompiler([FakeCompileResult(0), FakeCompileResult(0)])
+    # Agent "tries" each round but never actually resolves app.secret --
+    # forces exactly 2 loop rounds (max_config_mapping_attempts=2) before the
+    # phase gives up non-blockingly.
+    model = FakeToolModel([AIMessage(content="tried but gave up")] * 2)
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), model_override=model)
+    final = run(cfg, ctx)
+
+    assert final["run_outcome"] == "success"
+    assert final["total_llm_calls"] == 2
+    assert final["config_mapping_attempts"] == 2
+
+    config_map = json.loads((cfg.migration_dir / "config-map.json").read_text())
+    # mongodb.uri was seed-mapped and applied on round 1 (before the leftover
+    # key even reached the agent) -- it must still show up in the FINAL
+    # config-map.json, not just in application.properties on disk.
+    assert config_map["seed_mapped"] == {"spring.data.mongodb.uri": "mongodb://localhost:27017/mydb"}
+    assert config_map["leftover"] == {"app.secret": "changeme"}
+    text = properties_path(cfg).read_text(encoding="utf-8")
+    assert "spring.data.mongodb.uri=mongodb://localhost:27017/mydb" in text
+
+
+# ----------------------------------------------------------------------
 # 5. Global budget exhausted during config-mapping rounds aborts the run.
 # ----------------------------------------------------------------------
 
