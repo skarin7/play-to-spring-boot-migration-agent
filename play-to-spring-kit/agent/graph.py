@@ -36,7 +36,8 @@ mechanism any future phase can reuse — see the note below the diagram):
                                      "the app never starts" is not a non-blocking outcome)
 
     compile -+-> done ----------------------> slice_finalize | after_fix_cycle (route_by_phase)
-             +-> infra ---------------------> slice_finalize | after_fix_cycle (route_by_phase)
+             +-> human_gate -+-> infra -----> slice_finalize | after_fix_cycle (route_by_phase)
+                             +-> compile       (retry, interactive mode only)
              +-> det_fix -+-> compile          (deterministic re-loop)
                           +-> cluster -> guard -+-> agent -> compile
                                                 +-> halt --> slice_finalize | after_fix_cycle (route_by_phase)
@@ -46,6 +47,14 @@ fixers made no progress, and only if the guard (budget / retries / timeout /
 fingerprint loop detection) allows it. The compile-fix subgraph itself is
 phase-agnostic: `state["phase"]` ("slice" default | "fix_cycle") only changes
 where done/infra/halt exit to (route_by_phase), never their own logic.
+
+human_gate (M5) sits between compile's infra branch and the infra node
+itself: in headless mode (config.headless=True, the default, used by every
+automated/CI run) it is a no-op pass-through straight to "infra", identical
+to pre-M5 behavior; in interactive mode (--interactive) it pauses the graph
+via interrupt() so a human operator can inspect the failure and either
+retry the compile (in case it was a transient toolchain crash) or accept it
+as a hard infrastructure failure via the same "infra" node either way.
 
 Generic fix-cycle re-entry (any phase, not just routes, that needs to make
 edits and then re-verify via the shared compile-fix subgraph): a phase's own
@@ -97,6 +106,7 @@ from .nodes import bootstrap as bootstrap_nodes
 from .nodes import boot as boot_nodes
 from .nodes import config_mapping as config_mapping_nodes
 from .nodes import fix_loop
+from .nodes import human_gate as human_gate_nodes
 from .nodes import routes as routes_nodes
 from .nodes import slice_pipeline as slice_pipeline_nodes
 from .nodes.boot import route_after_boot_run, route_after_runtime_wiring_node
@@ -111,6 +121,7 @@ from .nodes.fix_loop import (
     route_after_det_fix,
     route_after_guard,
 )
+from .nodes.human_gate import route_after_human_gate
 from .nodes.routes import route_after_routes_node, routes_fix_prep_node
 from .nodes.slice_pipeline import (
     route_after_inventory,
@@ -184,6 +195,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     rt = routes_nodes.build(config, ctx)
     cm = config_mapping_nodes.build(config, ctx)
     bt = boot_nodes.build(config, ctx)
+    hg = human_gate_nodes.build(config, ctx)
 
     # ------------------------------------------------------------------
     # Wiring
@@ -215,6 +227,7 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("guard", fl["guard_node"])
     g.add_node("agent", fl["agent_node"])
     g.add_node("done", done_node)
+    g.add_node("human_gate", hg["human_gate_node"])
     g.add_node("infra", infra_node)
     g.add_node("halt", halt_node)
 
@@ -237,7 +250,10 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_conditional_edges(
         "compile",
         route_after_compile,
-        {"done": "done", "infra": "infra", "det_fix": "det_fix", "halt": "halt"},
+        {"done": "done", "infra": "human_gate", "det_fix": "det_fix", "halt": "halt"},
+    )
+    g.add_conditional_edges(
+        "human_gate", route_after_human_gate, {"compile": "compile", "infra": "infra"}
     )
     g.add_conditional_edges(
         "det_fix", route_after_det_fix, {"compile": "compile", "cluster": "cluster"}

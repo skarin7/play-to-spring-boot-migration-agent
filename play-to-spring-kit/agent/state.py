@@ -129,6 +129,11 @@ class MigrationState(TypedDict, total=False):
     boot_log_tail: str
     runtime_wiring_attempts: int
 
+    # human-in-the-loop gate on infra compile errors (M5): headless mode
+    # always resolves to "abort"; interactive mode resolves to "retry" or
+    # "abort" based on the human's interrupt() answer.
+    human_gate_decision: str  # "retry" | "abort"
+
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)
 EXIT_OK = 0
