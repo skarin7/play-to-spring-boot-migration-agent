@@ -48,7 +48,11 @@ class AgentConfig:
     # Config-mapping agent (M4)
     max_config_mapping_attempts: int = 2
 
-    # Runtime-wiring agent / boot verification (M4)
+    # Runtime-wiring agent / boot verification (M4). Worst case is a wall-clock
+    # lower bound, not counting each retry's own LLM tool-loop time: 6 attempts
+    # x 90s boot_timeout_sec = 9 minutes of boot-waiting alone, plus up to
+    # max_agent_tool_calls tool round-trips per attempt (premium tier for the
+    # last 4 attempts once escalate_after_retries=2 is exceeded).
     max_runtime_wiring_attempts: int = 6
     boot_timeout_sec: int = 90
 

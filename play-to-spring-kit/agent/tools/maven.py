@@ -38,7 +38,13 @@ class BootResult:
 
 def _default_popen_factory(argv: list[str], cwd: Path) -> subprocess.Popen:
     return subprocess.Popen(
-        argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        argv,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
     )
 
 
@@ -58,6 +64,7 @@ def _terminate(proc: Any) -> None:
     except Exception:
         try:
             proc.kill()
+            proc.wait(timeout=5)
         except Exception:
             pass
 
