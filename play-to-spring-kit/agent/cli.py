@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from .checkpoint import make_checkpointer, thread_id_for
 from .config import AgentConfig
@@ -28,6 +29,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--fresh", action="store_true", help="ignore existing checkpoint")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--interactive",
+        action="store_true",
+        help="pause on infrastructure errors for a human decision instead of failing immediately",
+    )
 
     # Setup phase (M3): toolkit build + kit setup.sh + optional conf export.
     p.add_argument("--workspace", type=Path, default=None, help="default: parent of --play-repo")
@@ -62,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         export_play_conf=args.export_play_conf,
         conf_strip_prefixes=list(args.conf_strip_prefix or []),
         max_bootstrap_attempts=args.max_bootstrap_attempts,
+        headless=not args.interactive,
     )
     if not config.spring_repo.is_dir():
         print(f"error: spring repo not found: {config.spring_repo}", file=sys.stderr)
@@ -93,6 +100,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         final = graph.invoke(initial, config=run_config)
+        while "__interrupt__" in final:
+            for itr in final["__interrupt__"]:
+                print(f"\n[human-gate] {itr.value}", file=sys.stderr)
+            answer = input(
+                "Compile hit an infrastructure error. Retry, or accept as a hard failure? [retry/abort]: "
+            )
+            final = graph.invoke(Command(resume=answer), config=run_config)
     except GraphRecursionError:
         # Backstop only: guards (budget/retries/timeout/loop detection) should
         # always halt before this fires. Fail closed with a defined exit code
