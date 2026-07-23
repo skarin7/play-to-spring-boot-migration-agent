@@ -2,11 +2,14 @@
 # Entry point for Play → Spring automated upgrade (full monorepo clone).
 # Delegates to play-to-spring-kit/scripts/migration_orchestrator.py — same CLI flags.
 #
-# --engine langgraph|legacy (default: legacy until M5 flips it):
-#   legacy    -> scripts/migration_orchestrator.py (cursor-agent, hardcoded phase order)
+# --engine langgraph|legacy (default: langgraph as of M5):
 #   langgraph -> python -m agent (play-to-spring-kit/agent/), OpenRouter-backed,
-#                requires OPENROUTER_API_KEY instead of CURSOR_API_KEY.
-# Or set MIGRATION_ENGINE=langgraph. --engine is stripped before forwarding argv.
+#                requires OPENROUTER_API_KEY instead of CURSOR_API_KEY. See
+#                docs/langgraph-engine.md for the full node/state model.
+#   legacy    -> scripts/migration_orchestrator.py (cursor-agent, hardcoded phase order),
+#                kept working for the transition; pass --engine legacy or set
+#                MIGRATION_ENGINE=legacy to opt back into it.
+# --engine is stripped before forwarding argv to the chosen engine.
 #
 # Creates play-to-spring-kit/.venv on first run and installs scripts/requirements-venv.txt
 # (orchestrator stays stdlib; optional deps e.g. pyhocon for --export-play-conf).
@@ -45,7 +48,7 @@ VENV_DIR="${KIT_ROOT}/.venv"
 VENV_PY="${VENV_DIR}/bin/python3"
 
 # --- Engine selection: --engine langgraph|legacy (or MIGRATION_ENGINE), stripped from argv ---
-ENGINE="${MIGRATION_ENGINE:-legacy}"
+ENGINE="${MIGRATION_ENGINE:-langgraph}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
