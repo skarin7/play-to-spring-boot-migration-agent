@@ -7,6 +7,7 @@ green, budget exhausted, or stuck. Resumable via the sqlite checkpointer.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -18,7 +19,7 @@ from .checkpoint import make_checkpointer, thread_id_for
 from .config import AgentConfig
 from .graph import build_graph, recursion_limit
 from .state import MigrationState
-from .status_v2 import write_status_v2
+from .status_v2 import status_v2_to_state, write_status_v2
 
 # Conventional "process interrupted before completing" code (matches the
 # shell's 128+SIGINT=130 convention). Used when the CLI can't get a
@@ -127,6 +128,34 @@ def main(argv: list[str] | None = None) -> int:
         "recursion_limit": recursion_limit(config),
     }
 
+    # One get_state call serves two purposes below: (1) adoption eligibility
+    # -- an empty .values means no langgraph checkpoint has ever been
+    # written for this thread, so a legacy migration-status.json (if any) is
+    # safe to adopt into `initial`; (2) resume-vs-fresh-invoke -- a non-empty
+    # .next means this thread is currently paused at human_gate's
+    # interrupt(), so we must resume it rather than starting over (see the
+    # comment at the invoke call below).
+    existing = graph.get_state(run_config)
+
+    if not args.fresh and not existing.values and config.status_path and config.status_path.is_file():
+        try:
+            raw_status = json.loads(config.status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: could not read {config.status_path} for adoption: {exc}", file=sys.stderr)
+            raw_status = None
+        if isinstance(raw_status, dict):
+            adopted = status_v2_to_state(raw_status)
+            units = adopted.get("migration_units")
+            if units:
+                done = sum(1 for u in units if u.get("status") == "done")
+                print(
+                    f"adopting legacy status from {config.status_path}: "
+                    f"{done}/{len(units)} units already done, "
+                    f"total_llm_calls={adopted.get('total_llm_calls', 0)}",
+                    file=sys.stderr,
+                )
+                initial.update(adopted)
+
     try:
         # A previous --interactive run may have left this exact thread paused
         # at human_gate's interrupt() (process killed, terminal closed, etc).
@@ -134,13 +163,12 @@ def main(argv: list[str] | None = None) -> int:
         # resume it -- it silently discards the pending paused task and
         # restarts the ENTIRE graph from START with fresh state (re-running
         # bootstrap/inventory/slice-pipeline/compile), throwing away the
-        # human's pending decision and burning real compute. Detect that
-        # case via get_state(...).next (non-empty tuple == paused, matches
-        # both InMemorySaver and the real SqliteSaver used here) and resume
-        # via invoke(None, ...) instead, which re-poses the same interrupt
-        # without re-executing anything upstream of it.
-        pending = graph.get_state(run_config)
-        if pending.next:
+        # human's pending decision and burning real compute. existing.next
+        # (non-empty tuple == paused, matches both InMemorySaver and the
+        # real SqliteSaver used here) tells us to resume via invoke(None,
+        # ...) instead, which re-poses the same interrupt without
+        # re-executing anything upstream of it.
+        if existing.next:
             final = graph.invoke(None, config=run_config)
         else:
             final = graph.invoke(initial, config=run_config)

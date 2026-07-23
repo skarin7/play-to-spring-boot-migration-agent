@@ -7,6 +7,7 @@ from agent import cli
 
 class FakeState:
     next = ()
+    values = {}
 
 
 class ExplodingGraph:
