@@ -5,7 +5,14 @@ from langgraph.errors import GraphRecursionError
 from agent import cli
 
 
+class FakeState:
+    next = ()
+
+
 class ExplodingGraph:
+    def get_state(self, config):
+        return FakeState()
+
     def invoke(self, initial, config):
         raise GraphRecursionError("Recursion limit of 5 reached without hitting a stop condition.")
 
