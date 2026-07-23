@@ -20,6 +20,35 @@ from .graph import build_graph, recursion_limit
 from .state import MigrationState
 from .status_v2 import write_status_v2
 
+# Conventional "process interrupted before completing" code (matches the
+# shell's 128+SIGINT=130 convention). Used when the CLI can't get a
+# retry/abort answer from a human (stdin closed or Ctrl-C at the prompt) --
+# the run itself is untouched and safely resumable under the same
+# thread_id, this is NOT a run failure, so it deliberately isn't one of the
+# OUTCOME_EXIT_CODES/RUN_OUTCOME_EXIT_CODES values in state.py.
+EXIT_AWAITING_HUMAN_INPUT = 130
+
+_HUMAN_GATE_LOG_TAIL_CHARS = 800
+
+
+def _print_interrupt(itr) -> None:
+    """Print an interrupt payload for a human to actually read: real
+    newlines in the log tail, not one long dict-repr line with literal
+    '\\n' escapes."""
+    payload = itr.value
+    if not isinstance(payload, dict):
+        print(f"\n[human-gate] {payload}", file=sys.stderr)
+        return
+    print(
+        f"\n[human-gate] reason={payload.get('reason')} slice_id={payload.get('slice_id')}",
+        file=sys.stderr,
+    )
+    log_tail = (payload.get("log_tail") or "")[-_HUMAN_GATE_LOG_TAIL_CHARS:]
+    if log_tail:
+        print("----- compile log (tail) -----", file=sys.stderr)
+        print(log_tail, file=sys.stderr)
+        print("----- end compile log -----", file=sys.stderr)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="agent", description="LangGraph migration engine")
@@ -99,13 +128,40 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     try:
-        final = graph.invoke(initial, config=run_config)
+        # A previous --interactive run may have left this exact thread paused
+        # at human_gate's interrupt() (process killed, terminal closed, etc).
+        # graph.invoke(initial, ...) on an already-paused thread does NOT
+        # resume it -- it silently discards the pending paused task and
+        # restarts the ENTIRE graph from START with fresh state (re-running
+        # bootstrap/inventory/slice-pipeline/compile), throwing away the
+        # human's pending decision and burning real compute. Detect that
+        # case via get_state(...).next (non-empty tuple == paused, matches
+        # both InMemorySaver and the real SqliteSaver used here) and resume
+        # via invoke(None, ...) instead, which re-poses the same interrupt
+        # without re-executing anything upstream of it.
+        pending = graph.get_state(run_config)
+        if pending.next:
+            final = graph.invoke(None, config=run_config)
+        else:
+            final = graph.invoke(initial, config=run_config)
+
         while "__interrupt__" in final:
             for itr in final["__interrupt__"]:
-                print(f"\n[human-gate] {itr.value}", file=sys.stderr)
-            answer = input(
-                "Compile hit an infrastructure error. Retry, or accept as a hard failure? [retry/abort]: "
-            )
+                _print_interrupt(itr)
+            try:
+                answer = input(
+                    "Compile hit an infrastructure error. Retry, or accept as a hard failure? [retry/abort]: "
+                )
+            except (EOFError, KeyboardInterrupt):
+                print(
+                    f"\nrun is paused at an infrastructure-error decision and is safely "
+                    f"resumable -- rerun the same command to continue (thread_id={thread_id})",
+                    file=sys.stderr,
+                )
+                return EXIT_AWAITING_HUMAN_INPUT
+            normalized = answer.strip().lower()
+            if normalized not in ("retry", "abort"):
+                print(f"unrecognized input '{answer}', treating as abort", file=sys.stderr)
             final = graph.invoke(Command(resume=answer), config=run_config)
     except GraphRecursionError:
         # Backstop only: guards (budget/retries/timeout/loop detection) should
