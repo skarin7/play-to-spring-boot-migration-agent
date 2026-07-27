@@ -42,7 +42,79 @@ class ToolLoopResult:
     input_tokens: int = 0
     output_tokens: int = 0
     stopped_by_cap: bool = False
+    compactions: int = 0
     messages: list[Any] = field(default_factory=list)
+
+
+_COMPACT_INSTRUCTION = (
+    "You are compacting the middle of an agent's tool-use transcript so it "
+    "keeps working inside a smaller context window. Summarize, concisely but "
+    "completely: files read, edits made, errors seen so far, and the "
+    "remaining plan. Do not invent anything not present in the transcript."
+)
+
+
+def _render_messages_for_summary(messages: Sequence[Any]) -> str:
+    lines: list[str] = []
+    for m in messages:
+        role = type(m).__name__
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        tool_calls = getattr(m, "tool_calls", None)
+        if tool_calls:
+            lines.append(f"{role} tool_calls={tool_calls}")
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _split_into_turns(messages: Sequence[Any]) -> list[list[Any]]:
+    """Group messages into turns, each starting at an AIMessage."""
+    turns: list[list[Any]] = []
+    current: list[Any] = []
+    for m in messages:
+        if isinstance(m, AIMessage):
+            if current:
+                turns.append(current)
+            current = [m]
+        else:
+            current.append(m)
+    if current:
+        turns.append(current)
+    return turns
+
+
+def compact_messages(messages: list[Any], config: AgentConfig) -> list[Any]:
+    """Summarize the middle of a tool-loop transcript to reclaim context budget.
+
+    messages[0] (system) and messages[1] (task) are preserved untouched. The
+    last 2 complete AI+Tool turns are kept verbatim as a tail -- the cut point
+    always lands on a full turn boundary so a tool_call is never split from
+    its ToolMessage result. Everything in between is replaced by one
+    synthetic HumanMessage holding a cheap-tier-model summary.
+    """
+    head = list(messages[:2])
+    turns = _split_into_turns(messages[2:])
+    if len(turns) <= 2:
+        return list(messages)
+
+    middle_turns, tail_turns = turns[:-2], turns[-2:]
+    middle = [m for turn in middle_turns for m in turn]
+    tail = [m for turn in tail_turns for m in turn]
+
+    model = make_model(config, config.model_cheap)
+    summary_response = model.invoke(
+        [
+            SystemMessage(content=_COMPACT_INSTRUCTION),
+            HumanMessage(content=_render_messages_for_summary(middle)),
+        ]
+    )
+    summary = (
+        summary_response.content
+        if isinstance(summary_response.content, str)
+        else str(summary_response.content)
+    )
+
+    return head + [HumanMessage(content=f"[Earlier progress, compacted]\n{summary}")] + tail
 
 
 def run_tool_loop(
