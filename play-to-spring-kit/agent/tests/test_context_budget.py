@@ -152,3 +152,108 @@ def test_run_tool_loop_under_budget_never_compacts(monkeypatch, tmp_path):
 
     assert result.final_text == "done"
     assert result.compactions == 0
+
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command
+
+
+def _graph_running_tool_loop(model, cfg, max_tool_calls=10):
+    """Minimal 1-node graph so run_tool_loop's interrupt() has a runnable
+    context, mirroring how it's really invoked (inside a graph node)."""
+
+    def node(state):
+        result = run_tool_loop(
+            model=model,
+            tools=[],
+            system="sys",
+            user="task",
+            max_tool_calls=max_tool_calls,
+            config=cfg,
+        )
+        return {"final_text": result.final_text, "compactions": result.compactions}
+
+    g = StateGraph(dict)
+    g.add_node("n", node)
+    g.set_entry_point("n")
+    g.add_edge("n", END)
+    return g.compile(checkpointer=InMemorySaver())
+
+
+def test_run_tool_loop_interactive_first_crossing_interrupts(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path, headless=False, max_agent_context_tokens=100)
+    graph = _graph_running_tool_loop(_BudgetFakeModel(), cfg)
+    run_cfg = {"configurable": {"thread_id": "t-interactive-1"}}
+
+    first = graph.invoke({}, config=run_cfg)
+
+    assert "__interrupt__" in first
+    itr = first["__interrupt__"][0]
+    assert itr.value["reason"] == "context_budget"
+    assert itr.value["input_tokens"] == 999_999
+    assert itr.value["threshold"] == 100
+
+
+def test_run_tool_loop_interactive_continue_skips_compaction(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path, headless=False, max_agent_context_tokens=100)
+    graph = _graph_running_tool_loop(_BudgetFakeModel(), cfg)
+    run_cfg = {"configurable": {"thread_id": "t-interactive-continue"}}
+
+    graph.invoke({}, config=run_cfg)
+    final = graph.invoke(Command(resume="continue"), config=run_cfg)
+
+    assert "__interrupt__" not in final
+    assert final["final_text"] == "done"
+    assert final["compactions"] == 0
+
+
+class _TwoCrossingsModel:
+    """Crosses budget on the 1st AND 2nd tool-call round; 'done' on the 3rd."""
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        if len(messages) in (2, 4):
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "noop", "args": {}, "id": str(len(messages))}],
+                usage_metadata={"input_tokens": 999_999, "output_tokens": 1, "total_tokens": 1_000_000},
+            )
+        return AIMessage(
+            content="done",
+            usage_metadata={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+        )
+
+
+def test_run_tool_loop_interactive_second_crossing_same_round_auto_compacts(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path, headless=False, max_agent_context_tokens=100)
+    graph = _graph_running_tool_loop(_TwoCrossingsModel(), cfg)
+    run_cfg = {"configurable": {"thread_id": "t-interactive-2x"}}
+
+    first = graph.invoke({}, config=run_cfg)
+    assert "__interrupt__" in first
+
+    final = graph.invoke(Command(resume="compact"), config=run_cfg)
+
+    assert "__interrupt__" not in final
+    assert final["final_text"] == "done"
+    assert final["compactions"] == 2
+
+
+def test_run_tool_loop_interactive_garbage_resume_defaults_to_compact(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path, headless=False, max_agent_context_tokens=100)
+    graph = _graph_running_tool_loop(_BudgetFakeModel(), cfg)
+    run_cfg = {"configurable": {"thread_id": "t-interactive-garbage"}}
+
+    graph.invoke({}, config=run_cfg)
+    final = graph.invoke(Command(resume="banana"), config=run_cfg)
+
+    assert "__interrupt__" not in final
+    assert final["final_text"] == "done"
+    assert final["compactions"] == 1
