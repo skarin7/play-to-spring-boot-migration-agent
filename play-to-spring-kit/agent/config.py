@@ -81,6 +81,9 @@ class AgentConfig:
         default_factory=lambda: _env_int("ESCALATE_AFTER_RETRIES", 2)
     )
     max_agent_tool_calls: int = field(default_factory=lambda: _env_int("MAX_AGENT_TOOL_CALLS", 8))
+    max_agent_context_tokens: int = field(
+        default_factory=lambda: _env_int("MAX_AGENT_CONTEXT_TOKENS", 50_000)
+    )
 
     def __post_init__(self) -> None:
         self.spring_repo = Path(self.spring_repo).resolve()
