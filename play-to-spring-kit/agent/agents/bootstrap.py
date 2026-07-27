@@ -86,6 +86,7 @@ def run_bootstrap(
         system=builder.system_prompt(),
         user=prompt,
         max_tool_calls=config.max_agent_tool_calls * 2,  # scaffolding 3 files needs more room than a fix round
+        config=config,
     )
     append_usage_log(
         config,
@@ -98,6 +99,7 @@ def run_bootstrap(
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "compactions": result.compactions,
             "edited_files": [str(p) for p in jail.edited_files],
         },
     )

@@ -78,6 +78,7 @@ def run_config_mapping_agent(
         system=system,
         user=_user_prompt(leftover),
         max_tool_calls=config.max_agent_tool_calls,
+        config=config,
     )
     append_usage_log(
         config,
@@ -91,6 +92,7 @@ def run_config_mapping_agent(
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "compactions": result.compactions,
             "edited_files": [str(p) for p in jail.edited_files],
         },
     )
