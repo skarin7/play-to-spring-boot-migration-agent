@@ -131,6 +131,9 @@ def run_tool_loop(
     bound = model.bind_tools(list(tools)) if tools else model
     messages: list[Any] = [SystemMessage(content=system), HumanMessage(content=user)]
     result = ToolLoopResult(final_text="")
+    # "Round" = one run_tool_loop call, not one while-loop iteration: this
+    # flag is set at most once for the whole call, so only the first budget
+    # crossing ever prompts; every later crossing auto-compacts silently.
     asked_this_round = False
 
     while True:
