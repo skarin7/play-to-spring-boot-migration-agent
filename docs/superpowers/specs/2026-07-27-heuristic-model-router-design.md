@@ -81,10 +81,15 @@ values below; no new state fields are introduced.
 
 | Phase | `retry_count` source | `item_count` source |
 |---|---|---|
-| compile_fix | `retry_count` (existing) | `len(clusters)` |
-| config_mapping | `attempt` | `len(leftover)` |
-| routes | `attempt` | `len(unmapped)` |
+| compile_fix | `retry_count` (existing, already 0-indexed) | `len(clusters)` |
+| config_mapping | `attempt - 1` | `len(leftover)` |
+| routes | `attempt - 1` | `len(unmapped)` |
 | runtime_wiring | `attempt - 1` (existing) | count of `Caused by:` occurrences in `boot_log_tail`, minimum 1 |
+
+`attempt - 1` matches `runtime_wiring`'s existing convention (attempt is
+1-indexed; retry_count is 0-indexed prior-retry count) — used for
+config_mapping/routes too so `escalate_after_retries` means the same thing
+in every phase.
 
 These 4 call sites replace their current `model_name = ...` line with:
 
