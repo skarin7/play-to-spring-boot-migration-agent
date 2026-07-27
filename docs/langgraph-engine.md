@@ -156,6 +156,7 @@ this precedence everywhere.
 | `TIMEOUT_PER_LAYER_MINS` | `30` | Per-slice wall-clock timeout. |
 | `ESCALATE_AFTER_RETRIES` | `2` | Retries before switching cheap → premium tier. |
 | `MAX_AGENT_TOOL_CALLS` | `8` | Tool-call cap per LLM round. |
+| `MAX_AGENT_CONTEXT_TOKENS` | `50000` | Context-budget threshold (input tokens) before `run_tool_loop` auto-compacts (headless) or asks once via `interrupt()` (`--interactive`). |
 
 ## Resumability
 
