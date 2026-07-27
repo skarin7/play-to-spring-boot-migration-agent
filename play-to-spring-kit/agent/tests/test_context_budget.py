@@ -5,7 +5,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 import agent.llm as llm_module
 from agent.config import AgentConfig
-from agent.llm import compact_messages
+from agent.llm import compact_messages, run_tool_loop
 
 
 def test_max_agent_context_tokens_default(tmp_path):
@@ -96,3 +96,59 @@ def test_compact_messages_uses_cheap_tier_model(monkeypatch, tmp_path):
     compact_messages(_build_transcript(4), cfg)
 
     assert seen["name"] == cfg.model_cheap
+
+
+class _BudgetFakeModel:
+    """Deterministic on len(messages) so it survives LangGraph interrupt replay
+    (see Task 4): identical inputs always produce identical outputs."""
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        if len(messages) == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "noop", "args": {}, "id": "1"}],
+                usage_metadata={"input_tokens": 999_999, "output_tokens": 1, "total_tokens": 1_000_000},
+            )
+        return AIMessage(
+            content="done",
+            usage_metadata={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+        )
+
+
+def test_run_tool_loop_headless_auto_compacts_over_budget(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path, max_agent_context_tokens=100)
+
+    result = run_tool_loop(
+        model=_BudgetFakeModel(),
+        tools=[],
+        system="sys",
+        user="task",
+        max_tool_calls=5,
+        config=cfg,
+    )
+
+    assert result.final_text == "done"
+    assert result.compactions == 1
+    assert result.stopped_by_cap is False
+
+
+def test_run_tool_loop_under_budget_never_compacts(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_module, "make_model", lambda config, name: _FakeSummaryModel())
+    cfg = AgentConfig(spring_repo=tmp_path)  # default 50_000, well above 999_999? no -- use high threshold
+    cfg.max_agent_context_tokens = 10_000_000
+
+    result = run_tool_loop(
+        model=_BudgetFakeModel(),
+        tools=[],
+        system="sys",
+        user="task",
+        max_tool_calls=5,
+        config=cfg,
+    )
+
+    assert result.final_text == "done"
+    assert result.compactions == 0
