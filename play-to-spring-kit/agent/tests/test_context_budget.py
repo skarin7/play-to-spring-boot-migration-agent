@@ -211,7 +211,11 @@ def test_run_tool_loop_interactive_continue_skips_compaction(monkeypatch, tmp_pa
 
 
 class _TwoCrossingsModel:
-    """Crosses budget on the 1st AND 2nd tool-call round; 'done' on the 3rd."""
+    """Crosses budget on the 1st AND 2nd tool-call round; 'done' on the 3rd.
+
+    Keyed on len(messages), not a call counter, for the same reason as
+    _BudgetFakeModel above -- the node replays from scratch on resume.
+    """
 
     def bind_tools(self, tools):
         return self
