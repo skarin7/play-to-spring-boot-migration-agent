@@ -18,9 +18,11 @@ task size.
 
 ## Goal
 
-Route each of the 5 agent calls to `model_cheap` or `model_premium` based on a cheap,
-deterministic signal of task complexity — not just retry count — with zero added LLM
-calls or latency.
+Route each of `compile_fix`, `config_mapping`, `routes`, `runtime_wiring` to
+`model_cheap` or `model_premium` based on a cheap, deterministic signal of task
+complexity — not just retry count — with zero added LLM calls or latency.
+`bootstrap` keeps its existing hardcoded premium tier (see Per-phase signal
+wiring below for why).
 
 ## Non-goals
 
@@ -66,18 +68,25 @@ for the phases that don't currently escalate.
 
 ## Per-phase signal wiring
 
-Each call site already computes or has access to the values below; no new state
-fields are introduced.
+`bootstrap` is excluded from the router and keeps its current hardcoded
+`config.model_premium`: it's a one-shot, high-stakes scaffold step (see the
+existing rationale in `agents/bootstrap.py`'s module docstring — "no cheap
+first pass like the per-slice compile-fix agent"), and the router's signals
+(retry_count=0, item_count from failing setup checks) would otherwise let a
+clean first attempt drop to cheap, silently reversing that intentional
+decision. The other 4 phases already have no such documented floor.
+
+Each of the remaining 4 call sites already computes or has access to the
+values below; no new state fields are introduced.
 
 | Phase | `retry_count` source | `item_count` source |
 |---|---|---|
-| bootstrap | `attempt` (`nodes/bootstrap.py:68`, already computed, currently unused for model choice) | count of failing setup checks (`pom_ok`/`app_ok`/`props_ok` — 0..3) |
 | compile_fix | `retry_count` (existing) | `len(clusters)` |
 | config_mapping | `attempt` | `len(leftover)` |
 | routes | `attempt` | `len(unmapped)` |
 | runtime_wiring | `attempt - 1` (existing) | count of `Caused by:` occurrences in `boot_log_tail`, minimum 1 |
 
-All 5 call sites replace their current `model_name = ...` line with:
+These 4 call sites replace their current `model_name = ...` line with:
 
 ```python
 model_name = config.choose_model(TaskSignals(retry_count=..., item_count=...))
@@ -90,9 +99,10 @@ model_name = config.choose_model(TaskSignals(retry_count=..., item_count=...))
   both.
 - `agent/tests/test_runtime_wiring_agent.py` (currently references `model_for_retry`):
   update to call `choose_model` with equivalent `TaskSignals`.
-- Each of the 5 agent test files gets one assertion that the `TaskSignals` values
-  passed to `choose_model` match the phase's documented `item_count` source (e.g.
-  `len(clusters)` for compile_fix).
+- Each of the 4 routed agent test files gets one assertion that the `TaskSignals`
+  values passed to `choose_model` match the phase's documented `item_count` source
+  (e.g. `len(clusters)` for compile_fix). `bootstrap` is unaffected (still
+  hardcoded `model_premium`), no test changes needed there.
 
 ## Error handling
 
