@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
+from langgraph.types import interrupt
 
 from .config import AgentConfig
 
@@ -123,18 +124,21 @@ def run_tool_loop(
     system: str,
     user: str,
     max_tool_calls: int,
+    config: AgentConfig,
 ) -> ToolLoopResult:
     """Run a bounded agentic loop: model <-> tools until no tool calls or cap hit."""
     tool_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     bound = model.bind_tools(list(tools)) if tools else model
     messages: list[Any] = [SystemMessage(content=system), HumanMessage(content=user)]
     result = ToolLoopResult(final_text="")
+    asked_this_round = False
 
     while True:
         ai: AIMessage = bound.invoke(messages)
         result.llm_requests += 1
         usage = getattr(ai, "usage_metadata", None) or {}
-        result.input_tokens += usage.get("input_tokens", 0)
+        current_input_tokens = usage.get("input_tokens", 0)
+        result.input_tokens += current_input_tokens
         result.output_tokens += usage.get("output_tokens", 0)
         messages.append(ai)
 
@@ -163,6 +167,30 @@ def run_tool_loop(
             result.stopped_by_cap = True
             LOG.warning("tool loop stopped: cap of %d tool calls reached", max_tool_calls)
             break
+
+        if current_input_tokens > config.max_agent_context_tokens:
+            do_compact = True
+            if not config.headless:
+                if not asked_this_round:
+                    asked_this_round = True
+                    decision = interrupt(
+                        {
+                            "reason": "context_budget",
+                            "input_tokens": current_input_tokens,
+                            "threshold": config.max_agent_context_tokens,
+                        }
+                    )
+                    normalized = decision if isinstance(decision, str) else str(decision)
+                    do_compact = normalized.strip().lower() != "continue"
+                # else: already asked this round -- auto-compact silently.
+            if do_compact:
+                messages = compact_messages(messages, config)
+                result.compactions += 1
+                LOG.info(
+                    "tool loop compacted: input_tokens=%d threshold=%d",
+                    current_input_tokens,
+                    config.max_agent_context_tokens,
+                )
 
     result.messages = messages
     return result
