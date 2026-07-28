@@ -40,6 +40,32 @@ def error_signature(e: dict[str, Any]) -> str:
     return f"{fp}:{line}:{msg}"
 
 
+# Packages with zero Spring/Jakarta equivalent -- unlike javax.inject/guava/neo4j
+# (see _KNOWN_DEP_BY_PACKAGE_PREFIX below), no pom.xml dependency addition or
+# import swap can ever resolve these. Code using them (Play/Pekko's reactive-streams
+# WebSocket pattern: MergeHub/BroadcastHub/ActorSystem/Materializer) needs a real
+# redesign around Spring's own APIs (e.g. WebSocketHandler), not a symptom-level fix.
+_NO_SPRING_EQUIVALENT_PACKAGE_PREFIXES = ("org.apache.pekko", "akka.")
+
+
+def unmappable_framework_packages(errors: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """file -> set of no-Spring-equivalent package names found in that file's
+    'package X does not exist' errors. Used to tell a genuinely stuck
+    compile-fix loop (guard: looping / retries_exhausted with zero progress)
+    apart from one that just needs more attempts -- see slice_pipeline.py's
+    slice_finalize_node."""
+    by_file: dict[str, set[str]] = {}
+    for e in errors:
+        msg = (e.get("message") or "").strip()
+        m = MVN_PACKAGE_MISSING_RE.search(msg)
+        if not m:
+            continue
+        pkg = m.group(1)
+        if pkg.startswith(_NO_SPRING_EQUIVALENT_PACKAGE_PREFIXES):
+            by_file.setdefault(str(e.get("file", "?")), set()).add(pkg)
+    return by_file
+
+
 def classify_compile_errors(
     errors: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:

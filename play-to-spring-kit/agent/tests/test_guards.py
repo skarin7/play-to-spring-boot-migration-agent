@@ -10,11 +10,20 @@ def make_config(tmp_path: Path, **kw) -> AgentConfig:
     return cfg
 
 
+_A_CLUSTER = [{"root_cause": "cannot find symbol", "representative": {}, "affected_files": ["A.java"], "count": 1}]
+
+# last_clusters mirrors what cluster_node always sets before guard_node runs
+# in the real graph (route_after_compile only reaches cluster/guard on a
+# failed compile, so there's always at least one error to cluster) --
+# non-empty here so these tests exercise every OTHER guard branch without
+# tripping the "nothing left to fix" check (see test_looping_no_clusters_left
+# for that branch specifically).
 BASE_STATE = {
     "retry_count": 0,
     "total_llm_calls": 0,
     "slice_started_at": 1000.0,
     "error_fingerprints": [],
+    "last_clusters": _A_CLUSTER,
 }
 
 
@@ -56,6 +65,15 @@ def test_no_llm_without_api_key(tmp_path):
     cfg = make_config(tmp_path)
     cfg.api_key = None
     assert decide(dict(BASE_STATE), cfg, now=1010.0) == "no_llm"
+
+
+def test_looping_no_clusters_left(tmp_path):
+    """Regression: every remaining error's signature already excluded (from a
+    prior 'looping' round) must halt instead of invoking the agent with an
+    empty prompt -- see agent/guards.py's last_clusters check."""
+    cfg = make_config(tmp_path)
+    state = dict(BASE_STATE, last_clusters=[])
+    assert decide(state, cfg, now=1010.0) == "looping"
 
 
 def test_priority_budget_before_loop(tmp_path):

@@ -11,6 +11,14 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dotenv import find_dotenv, load_dotenv
+
+# Loaded once at import time, before any AgentConfig() reads os.environ.
+# find_dotenv() walks up from cwd, so this picks up the repo-root .env
+# regardless of whether you run from repo root or play-to-spring-kit/.
+# Vars already set in the real environment are never overridden (override=False).
+load_dotenv(find_dotenv(usecwd=True))
+
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL_CHEAP = "anthropic/claude-haiku-4.5"
 DEFAULT_MODEL_PREMIUM = "anthropic/claude-sonnet-4.5"

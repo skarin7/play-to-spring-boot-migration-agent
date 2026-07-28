@@ -165,6 +165,72 @@ def test_looping_detected_and_signatures_excluded(tmp_path):
     assert final["total_llm_calls"] == 1  # second round blocked by loop detection
 
 
+PEKKO_ERR = {"file": "HomeController.java", "line": 3, "message": "package org.apache.pekko does not exist"}
+
+
+def test_looping_with_unmappable_package_gets_manual_intervention_note(tmp_path):
+    cfg = make_config(tmp_path)
+    compiler = FakeCompiler([FakeCompileResult(1, [PEKKO_ERR]), FakeCompileResult(1, [PEKKO_ERR])])
+    ctx = RuntimeCtx(
+        compiler,
+        FakeFixer([0, 0]),
+        _real_clusterer(),
+        model_override=FakeToolModel([AIMessage(content="tried"), AIMessage(content="tried")]),
+    )
+    final = run(cfg, ctx)
+    assert final["outcome"] == "looping"
+    note = final["migration_units"][0]["manual_intervention_note"]
+    assert note is not None
+    assert "org.apache.pekko" in note
+    assert "HomeController.java" in note
+
+
+def test_looping_without_unmappable_package_has_no_note(tmp_path):
+    cfg = make_config(tmp_path)
+    compiler = FakeCompiler([FakeCompileResult(1, [ERR]), FakeCompileResult(1, [ERR])])
+    ctx = RuntimeCtx(
+        compiler,
+        FakeFixer([0, 0]),
+        _real_clusterer(),
+        model_override=FakeToolModel([AIMessage(content="tried"), AIMessage(content="tried")]),
+    )
+    final = run(cfg, ctx)
+    assert final["outcome"] == "looping"
+    assert final["migration_units"][0]["manual_intervention_note"] is None
+
+
+def test_agent_flags_manual_review_and_note_reaches_migration_units(tmp_path):
+    """End-to-end: agent calls flag_for_manual_review (real FsJail tool, via
+    compile_fix.py's real run_tool_loop) -> guard stops after just 1 round
+    (no fingerprint repeat needed) -> slice_finalize_node's note is the
+    agent's own reason, not the deterministic package-regex guess."""
+    cfg = make_config(tmp_path)
+    compiler = FakeCompiler([FakeCompileResult(1, [ERR]), FakeCompileResult(1, [ERR])])
+    ctx = RuntimeCtx(
+        compiler,
+        FakeFixer([0, 0]),
+        _real_clusterer(),
+        model_override=FakeToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "flag_for_manual_review",
+                            "args": {"reason": "Akka streams has no Spring equivalent"},
+                            "id": "1",
+                        }
+                    ],
+                )
+            ]
+        ),
+    )
+    final = run(cfg, ctx)
+    assert final["outcome"] == "looping"
+    assert final["total_llm_calls"] == 1
+    assert final["migration_units"][0]["manual_intervention_note"] == "Akka streams has no Spring equivalent"
+
+
 def test_no_api_key_halts_with_exit_2(tmp_path):
     cfg = make_config(tmp_path)
     cfg.api_key = None

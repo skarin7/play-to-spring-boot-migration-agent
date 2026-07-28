@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Entry point for Play → Spring automated upgrade (full monorepo clone).
-# Delegates to play-to-spring-kit/scripts/migration_orchestrator.py — same CLI flags.
+# Delegates to play-to-spring-kit/scripts/legacy/migration_orchestrator.py — same CLI flags.
 #
 # --engine langgraph|legacy (default: langgraph as of M5):
 #   langgraph -> python -m agent (play-to-spring-kit/agent/), OpenRouter-backed,
 #                requires OPENROUTER_API_KEY instead of CURSOR_API_KEY. See
 #                docs/langgraph-engine.md for the full node/state model.
-#   legacy    -> scripts/migration_orchestrator.py (cursor-agent, hardcoded phase order),
+#   legacy    -> scripts/legacy/migration_orchestrator.py (cursor-agent, hardcoded phase order),
 #                kept working for the transition; pass --engine legacy or set
 #                MIGRATION_ENGINE=legacy to opt back into it.
 # --engine is stripped before forwarding argv to the chosen engine.
@@ -40,8 +40,19 @@
 
 set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env into the shell env so the OPENROUTER_API_KEY/CURSOR_API_KEY checks below
+# (and JAVA_HOME etc.) see vars set only in .env, not just already-exported ones.
+# agent/config.py's load_dotenv() also loads .env for the Python process itself;
+# this is just so this script's own pre-flight warnings aren't false positives.
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/.env"
+  set +a
+fi
 KIT_ROOT="${REPO_ROOT}/play-to-spring-kit"
-ORCHESTRATOR="${KIT_ROOT}/scripts/migration_orchestrator.py"
+ORCHESTRATOR="${KIT_ROOT}/scripts/legacy/migration_orchestrator.py"
 REQ_VENV="${KIT_ROOT}/scripts/requirements-venv.txt"
 REQ_AGENT="${KIT_ROOT}/scripts/requirements-agent.txt"
 VENV_DIR="${KIT_ROOT}/.venv"

@@ -28,6 +28,12 @@ def decide(state: MigrationState, config: AgentConfig, now: float | None = None)
     if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
         return "budget_exhausted"
 
+    # The agent itself already told us (via flag_for_manual_review, tools/fs.py)
+    # that this needs a redesign, not more incremental attempts -- no point
+    # burning further retries/tool calls re-discovering what it already found.
+    if state.get("agent_manual_review_reason") is not None:
+        return "looping"
+
     if state.get("retry_count", 0) >= config.max_retries_per_layer:
         return "retries_exhausted"
 
@@ -36,6 +42,18 @@ def decide(state: MigrationState, config: AgentConfig, now: float | None = None)
 
     fingerprints = state.get("error_fingerprints", [])
     if len(fingerprints) >= 2 and is_looping(fingerprints[-1], fingerprints[:-1]):
+        return "looping"
+
+    # cluster_node only runs when compile actually failed (route_after_compile
+    # sends a clean compile straight to "done"), so last_compile.errors is
+    # guaranteed non-empty here. An empty last_clusters therefore means every
+    # remaining error's signature is already in excluded_error_signatures
+    # (from a prior "looping" round) -- there is nothing left to put in an LLM
+    # prompt. Without this check decide() falls through to "agent" and the
+    # fix agent gets invoked with a blank error list: a wasted LLM round that
+    # just explores files with no directive instead of surfacing the real
+    # "stuck" state.
+    if not state.get("last_clusters"):
         return "looping"
 
     if not config.api_key:

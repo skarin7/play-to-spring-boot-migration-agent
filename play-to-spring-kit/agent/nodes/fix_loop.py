@@ -175,18 +175,21 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         return updates
 
     def agent_node(state: MigrationState) -> dict:
-        edited, _result = run_compile_fix(
+        edited, result = run_compile_fix(
             config=config,
             cluster_dicts=state.get("last_clusters", []),
             retry_count=state.get("retry_count", 0),
             slice_id=state.get("slice_id", "default"),
             model_override=ctx.model_override,
         )
-        return {
+        updates: dict = {
             "retry_count": state.get("retry_count", 0) + 1,
             "total_llm_calls": state.get("total_llm_calls", 0) + 1,
             "last_edited_files": [str(p) for p in edited],
         }
+        if result.manual_review_reason is not None:
+            updates["agent_manual_review_reason"] = result.manual_review_reason
+        return updates
 
     return {
         "compile_node": compile_node,

@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable
 
-from .. import inventory
+from .. import inventory, legacy_logic
 from ..config import AgentConfig
 from ..state import (
     OUTCOME_EXIT_CODES,
@@ -21,6 +21,30 @@ if TYPE_CHECKING:
     from ..graph import RuntimeCtx
 
 LOG = logging.getLogger("agent.nodes.slice_pipeline")
+
+
+def _manual_intervention_note(state: MigrationState) -> str | None:
+    """None unless there's a reason to believe the compile-fix loop is stuck
+    on something that needs a redesign, not more auto-fix attempts.
+
+    Prefers the agent's own diagnosis (agent_manual_review_reason, set via
+    the flag_for_manual_review tool -- see tools/fs.py) since it generalizes
+    to any framework/library mismatch the model recognizes, not just the
+    ones this codebase happens to have a regex for. Falls back to the
+    deterministic unmappable_framework_packages() guess (currently just
+    Akka/Pekko) for older runs or a model that didn't call the tool."""
+    reason = state.get("agent_manual_review_reason")
+    if reason:
+        return reason
+    errors = state.get("last_compile", {}).get("errors", [])
+    by_file = legacy_logic.unmappable_framework_packages(errors)
+    if not by_file:
+        return None
+    parts = [f"{f} ({', '.join(sorted(pkgs))})" for f, pkgs in sorted(by_file.items())]
+    return (
+        "Automatic fixing stalled on package(s) with no Spring/Jakarta equivalent -- "
+        "these file(s) need manual redesign, not an import/symbol fix: " + "; ".join(parts)
+    )
 
 
 def route_after_inventory(state: MigrationState) -> str:
@@ -48,6 +72,7 @@ def slice_router_node(state: MigrationState) -> dict:
         "last_clusters": [],
         "last_edited_files": [],
         "det_fixed_last_round": 0,
+        "agent_manual_review_reason": None,
         "slice_started_at": 0.0,
         "guard_decision": None,
         "outcome": None,
@@ -146,6 +171,7 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         elif outcome == "looping":
             unit["status"] = "loop_detected"
             unit["failure_reason"] = "loop_detected"
+            unit["manual_intervention_note"] = _manual_intervention_note(state)
         elif outcome == "infrastructure_error":
             unit["status"] = "needs_manual_fix"
             unit["failure_reason"] = "infrastructure_error"
@@ -158,6 +184,7 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         else:  # "failed" (retries_exhausted) or anything else terminal
             unit["status"] = "failed"
             unit["failure_reason"] = "max_retries"
+            unit["manual_intervention_note"] = _manual_intervention_note(state)
 
         if idx < len(units):
             units[idx] = unit
