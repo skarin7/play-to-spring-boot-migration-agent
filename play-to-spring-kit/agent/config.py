@@ -80,6 +80,9 @@ class AgentConfig:
     escalate_after_retries: int = field(
         default_factory=lambda: _env_int("ESCALATE_AFTER_RETRIES", 2)
     )
+    escalate_item_threshold: int = field(
+        default_factory=lambda: _env_int("MIGRATION_ESCALATE_ITEM_THRESHOLD", 5)
+    )
     max_agent_tool_calls: int = field(default_factory=lambda: _env_int("MAX_AGENT_TOOL_CALLS", 8))
     max_agent_context_tokens: int = field(
         default_factory=lambda: _env_int("MAX_AGENT_CONTEXT_TOKENS", 50_000)
@@ -102,8 +105,24 @@ class AgentConfig:
     def migration_dir(self) -> Path:
         return self.spring_repo / ".migration"
 
-    def model_for_retry(self, retry_count: int) -> str:
-        """Two-tier escalation: cheap first, premium after N retries."""
-        if retry_count >= self.escalate_after_retries:
+    def choose_model(self, signals: "TaskSignals") -> str:
+        """Two-tier heuristic routing: escalate to model_premium when either
+        the retry count or the task's item_count (phase-specific magnitude of
+        remaining work -- error clusters, unmapped routes, leftover config
+        keys, boot-failure count) crosses its threshold."""
+        if signals.retry_count >= self.escalate_after_retries:
+            return self.model_premium
+        if signals.item_count >= self.escalate_item_threshold:
             return self.model_premium
         return self.model_cheap
+
+
+@dataclass
+class TaskSignals:
+    """Complexity signals fed to AgentConfig.choose_model. item_count's
+    meaning is phase-specific (error clusters, unmapped routes, leftover
+    config keys, boot-failure count) -- see docs/superpowers/specs/
+    2026-07-27-heuristic-model-router-design.md."""
+
+    retry_count: int = 0
+    item_count: int = 0
