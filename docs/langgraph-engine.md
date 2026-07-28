@@ -148,13 +148,14 @@ this precedence everywhere.
 |---|---|---|
 | `OPENROUTER_API_KEY` | *(none)* | Required for any LLM round. Without it, deterministic fixers still run; LLM-gated phases resolve to `no_llm`/skip gracefully rather than crashing. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint works. |
-| `MIGRATION_MODEL_CHEAP` | `anthropic/claude-haiku-4.5` | First-tier model (compile-fix, routes, config-mapping, first runtime-wiring attempts). |
-| `MIGRATION_MODEL_PREMIUM` | `anthropic/claude-sonnet-4.5` | Escalation tier (bootstrap; compile-fix and runtime-wiring after `ESCALATE_AFTER_RETRIES`). |
+| `MIGRATION_MODEL_CHEAP` | `anthropic/claude-haiku-4.5` | First-tier model (compile-fix, routes, config-mapping, runtime-wiring, before either escalation threshold is crossed). |
+| `MIGRATION_MODEL_PREMIUM` | `anthropic/claude-sonnet-4.5` | Escalation tier. Always used for bootstrap (one-shot, high-stakes scaffold — never routed). For compile-fix, routes, config-mapping, and runtime-wiring, `AgentConfig.choose_model` picks this tier once either `ESCALATE_AFTER_RETRIES` or `MIGRATION_ESCALATE_ITEM_THRESHOLD` is crossed (see below) — whichever fires first. |
 | `LLM_TIMEOUT_SEC` | `600` | Per-request timeout. |
 | `MAX_TOTAL_LLM_CALLS` | `50` | Global run budget — the one guardrail that always aborts the whole run when exhausted. |
 | `MAX_RETRIES_PER_LAYER` | `5` | Per-slice compile-fix retry cap. |
 | `TIMEOUT_PER_LAYER_MINS` | `30` | Per-slice wall-clock timeout. |
 | `ESCALATE_AFTER_RETRIES` | `2` | Retries before switching cheap → premium tier. |
+| `MIGRATION_ESCALATE_ITEM_THRESHOLD` | `5` | Alternate escalation trigger: switches cheap → premium when a round's task size (error-cluster count for compile-fix, unmapped-route count for routes, leftover-key count for config-mapping, distinct `Caused by:` count for runtime-wiring) reaches this value, even on attempt 1. Note: routes/config-mapping pass the *full* remaining-work count each round (not a per-slice batch), so real apps with more than this many unmapped routes or leftover config keys will escalate those two phases to premium on attempt 1 by default — lower this or raise it depending on your cost/quality tradeoff. |
 | `MAX_AGENT_TOOL_CALLS` | `8` | Tool-call cap per LLM round. |
 | `MAX_AGENT_CONTEXT_TOKENS` | `50000` | Context-budget threshold (input tokens) before `run_tool_loop` auto-compacts (headless) or asks once via `interrupt()` (`--interactive`). |
 
