@@ -1,12 +1,11 @@
 """agents/runtime_wiring.py unit tests: one runtime-wiring round with a fake
-model, the reference-doc heading slice, and tier escalation (cheap x2 then
-premium, via config.model_for_retry -- unlike routes/config_mapping which
-are cheap-only)."""
+model, the reference-doc heading slice, and tier escalation via
+config.choose_model (retry_count and Caused-by-count item_count signals)."""
 
 from langchain_core.messages import AIMessage
 
 from agent.agents.runtime_wiring import load_runtime_wiring_reference, run_runtime_wiring_agent
-from agent.config import AgentConfig
+from agent.config import AgentConfig, TaskSignals
 
 
 class FakeToolModel:
@@ -77,17 +76,36 @@ def test_tier_escalates_cheap_then_premium_after_escalate_after_retries(tmp_path
     attempt 3+ is premium."""
     cfg = AgentConfig(spring_repo=tmp_path)
     seen_models: list[str] = []
-    orig_model_for_retry = cfg.model_for_retry
+    orig_choose_model = cfg.choose_model
 
-    def spy(retry_count):
-        model_name = orig_model_for_retry(retry_count)
+    def spy(signals):
+        model_name = orig_choose_model(signals)
         seen_models.append(model_name)
         return model_name
 
-    cfg.model_for_retry = spy
+    cfg.choose_model = spy
 
     for attempt in (1, 2, 3):
         model = FakeToolModel([AIMessage(content="tried")])
         run_runtime_wiring_agent(cfg, "boot failed", attempt=attempt, model_override=model)
 
     assert seen_models == [cfg.model_cheap, cfg.model_cheap, cfg.model_premium]
+
+
+def test_item_count_from_caused_by_count_escalates_tier(tmp_path):
+    cfg = AgentConfig(spring_repo=tmp_path)
+    assert cfg.escalate_item_threshold == 5
+    boot_log = "\n".join([f"Caused by: java.lang.Exception {i}" for i in range(5)])
+    seen_signals = []
+    orig_choose_model = cfg.choose_model
+
+    def spy(signals):
+        seen_signals.append(signals)
+        return orig_choose_model(signals)
+
+    cfg.choose_model = spy
+    model = FakeToolModel([AIMessage(content="tried")])
+
+    run_runtime_wiring_agent(cfg, boot_log, attempt=1, model_override=model)
+
+    assert seen_signals == [TaskSignals(retry_count=0, item_count=5)]
