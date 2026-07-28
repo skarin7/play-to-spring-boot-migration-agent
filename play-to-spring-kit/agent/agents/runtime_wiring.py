@@ -4,10 +4,10 @@
 missing beans, bad `@ConditionalOnExpression` gaps, and other runtime-only
 wiring failures (see docs/compile-fixes-for-toolkit.md's "Spring Boot
 runtime" table) are invisible until `mvn spring-boot:run` is actually
-attempted (agent/tools/maven.py). This agent is the one M4 phase that
-escalates tiers (cheap x2 then premium, via config.model_for_retry) rather
-than staying cheap-only like routes/config_mapping -- runtime wiring bugs
-are higher-stakes than mechanical annotation/property work.
+attempted (agent/tools/maven.py). Model tier is picked by
+config.choose_model: escalates to premium on repeated retries or a boot log
+with several distinct "Caused by:" failures (see docs/superpowers/specs/
+2026-07-27-heuristic-model-router-design.md).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import AgentConfig
+from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
 from ..tools.setup_ops import kit_root
@@ -80,6 +80,10 @@ def _user_prompt(boot_log_tail: str) -> str:
     )
 
 
+def _caused_by_count(boot_log_tail: str) -> int:
+    return max(1, boot_log_tail.count("Caused by:"))
+
+
 def run_runtime_wiring_agent(
     config: AgentConfig,
     boot_log_tail: str,
@@ -87,7 +91,9 @@ def run_runtime_wiring_agent(
     model_override: Any = None,
 ) -> tuple[list[Path], ToolLoopResult]:
     """One runtime-wiring round. Returns (edited files, loop result)."""
-    model_name = config.model_for_retry(attempt - 1)
+    model_name = config.choose_model(
+        TaskSignals(retry_count=attempt - 1, item_count=_caused_by_count(boot_log_tail))
+    )
     model = model_override if model_override is not None else make_model(config, model_name)
 
     jail = FsJail(config.spring_repo, config.play_repo)
