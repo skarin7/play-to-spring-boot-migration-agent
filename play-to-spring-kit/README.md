@@ -2,7 +2,13 @@
 
 **Independent, reusable** kit to migrate any **Play Framework (Java)** repo to **Spring Boot**.
 
-- **`scripts/migration_orchestrator.py`** is the usual entry point: it **builds `java-dev-toolkit`**, copies the JAR into **`lib/`**, runs **`setup.sh`** to **prepare the workspace** (Spring layout, Cursor skills, JAR into the play repo, **`workspace.yaml`**), then drives **layered `migrate-app` + `mvn compile`**, with optional headless **`cursor-agent`** for compile fixes. Details: **[scripts/README.md](scripts/README.md)**.
+> **Default engine is now LangGraph** (`agent/`, driven via `../start_upgrade.sh` or `python -m agent`
+> from this directory) — see **[../docs/langgraph-engine.md](../docs/langgraph-engine.md)** for
+> architecture, CLI flags, env vars, and resumability. Everything below this point documents the
+> **legacy** Cursor-based orchestrator (`scripts/legacy/migration_orchestrator.py`), still available via
+> `--engine legacy` / `MIGRATION_ENGINE=legacy` during the transition.
+
+- **`scripts/legacy/migration_orchestrator.py`** is the legacy entry point: it **builds `java-dev-toolkit`**, copies the JAR into **`lib/`**, runs **`setup.sh`** to **prepare the workspace** (Spring layout, Cursor skills, JAR into the play repo, **`workspace.yaml`**), then drives **layered `migrate-app` + `mvn compile`**, with optional headless **`cursor-agent`** for compile fixes. Details: **[scripts/README.md](scripts/README.md)**.
 - **LLM/agent** initializes the Spring project (`pom.xml`, `Application.java`, `application.properties`) by reading the Play project.
 - **CLI** does ~70% deterministic migration; **LLM/agent** fixes the rest until the build is clean.
 
@@ -14,7 +20,7 @@ From the **monorepo root** you can use **`./start_upgrade.sh --play-repo …`** 
 
 ```bash
 cd /path/to/play-to-spring-kit
-python3 scripts/migration_orchestrator.py --play-repo /path/to/<play-repo>
+python3 scripts/legacy/migration_orchestrator.py --play-repo /path/to/<play-repo>
 # or relative:  --play-repo ../<play-repo>
 ```
 
@@ -71,20 +77,20 @@ Summary:
 
 - **Only `--play-repo`** is required (absolute or relative to your shell cwd); by default the **dev-toolkit Maven build** and **workspace preparation** run on every invocation (idempotent). Use **`--skip-build-toolkit`** when the JAR in **`lib/`** is already up to date.
 - Spring repo and default **`migration-status.json`** come from **`workspace.yaml`** or **`spring-<play-basename>`**.
-- Prefer **`cd play-to-spring-kit`** then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`** so relative play paths match your tree; kit paths are resolved from the script location, not cwd.
+- Prefer **`cd play-to-spring-kit`** then **`python3 scripts/legacy/migration_orchestrator.py --play-repo ../your-play-app`** so relative play paths match your tree; kit paths are resolved from the script location, not cwd.
 
 ## Architecture & autonomous pipeline
 
-See **[docs/play_to_spring_migration.md](docs/play_to_spring_migration.md)** for the full architecture: orchestrator + skills + **`dev-toolkit-1.0.0.jar`**, state file, layer order, and failure handling.
+See **[docs/legacy/play_to_spring_migration.md](docs/legacy/play_to_spring_migration.md)** for the full architecture: orchestrator + skills + **`dev-toolkit-1.0.0.jar`**, state file, layer order, and failure handling.
 
 **Autonomous options:**
 
 1. **Cursor** — open the Play repo → **Agent** → skill **`play-spring-orchestrator`** → e.g. *“Execute the full play-spring-orchestrator migration loop… resume from migration-status.json if present.”* (**§2.1** in that doc.)
-2. **Python CLI** — **`scripts/migration_orchestrator.py`** (this repo), same state file and layer order; optional **`cursor-agent`** for compile fixes.
+2. **Python CLI** — **`scripts/legacy/migration_orchestrator.py`** (this repo), same state file and layer order; optional **`cursor-agent`** for compile fixes.
 
 ## Orchestration (Cursor agent flow)
 
-See **[docs/ORCHESTRATION.md](docs/ORCHESTRATION.md)** for the step-by-step guide.
+See **[docs/legacy/ORCHESTRATION.md](docs/legacy/ORCHESTRATION.md)** for the step-by-step guide.
 
 One **orchestrator agent** runs three steps:
 
@@ -99,7 +105,7 @@ All commands are in the skills; the agent runs CLI directly.
 - **Bash** (only if you run **`./scripts/setup.sh`** manually instead of relying on **`migration_orchestrator.py`**)
 - **Maven** (for the Spring project)
 - **Java 17+** (for Spring Boot 3 and the dev-toolkit JAR)
-- **Python 3.10+** (for **`scripts/migration_orchestrator.py`**)
+- **Python 3.10+** (for **`scripts/legacy/migration_orchestrator.py`**)
 - **`cursor-agent`** on `PATH` (only if you use API-key mode with the Python orchestrator; see **[scripts/README.md](scripts/README.md)**)
 
 ## Layout after workspace preparation
@@ -108,9 +114,11 @@ All commands are in the skills; the agent runs CLI directly.
 play-to-spring-kit/                   # This kit (clone)
 ├── lib/                              # dev-toolkit-*.jar (orchestrator build or manual copy)
 ├── scripts/
-│   ├── setup.sh                      # Manual kit install (optional; orchestrator runs it automatically)
-│   ├── migration_orchestrator.py    # Recommended: bootstrap + layered migrate + compile
+│   ├── setup.sh                      # Shared: workspace prep (both engines)
+│   ├── legacy/
+│   │   └── migration_orchestrator.py # Legacy engine entry point (--engine legacy)
 │   └── README.md
+├── agent/                            # LangGraph engine (default)
 ├── skills/                           # Source skill markdown (copied into play .cursor/skills/)
 └── docs/
 
@@ -145,7 +153,7 @@ After workspace preparation, skills live under `<play-repo>/.cursor/skills/` so 
 
 ```bash
 cd play-to-spring-kit
-python3 scripts/migration_orchestrator.py --play-repo <path-to-play-repo>
+python3 scripts/legacy/migration_orchestrator.py --play-repo <path-to-play-repo>
 ```
 
 See **[scripts/README.md](scripts/README.md)** for **`--toolkit-root`** / **`JAVA_DEV_TOOLKIT_ROOT`** if your layout differs.

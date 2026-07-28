@@ -76,7 +76,8 @@ def run_bootstrap(
     step1_md = load_builder_skill_step1_markdown(config.play_repo)
     prompt = builder.bootstrap_prompt(step1_md=step1_md)
 
-    model = model_override if model_override is not None else make_model(config, config.model_premium)
+    model_name = config.model_premium
+    model = model_override if model_override is not None else make_model(config, model_name)
 
     jail = FsJail(config.spring_repo, config.play_repo)
     started = time.time()
@@ -87,6 +88,8 @@ def run_bootstrap(
         user=prompt,
         max_tool_calls=config.max_agent_tool_calls * 2,  # scaffolding 3 files needs more room than a fix round
         config=config,
+        model_name=model_name,
+        phase="bootstrap",
     )
     append_usage_log(
         config,
@@ -94,7 +97,7 @@ def run_bootstrap(
             "ts": started,
             "phase": "bootstrap",
             "attempt": attempt,
-            "model": config.model_premium,
+            "model": model_name,
             "llm_requests": result.llm_requests,
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,

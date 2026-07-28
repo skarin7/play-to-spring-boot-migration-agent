@@ -18,6 +18,58 @@ from ..tools.fs import FsJail
 
 LOG = logging.getLogger("agent.compile_fix")
 
+_MAX_INLINE_FILES = 5
+_MAX_INLINE_FILE_CHARS = 8000
+
+
+def _inline_affected_files(spring_repo: Path, clusters: list[Any]) -> str:
+    """Read the files these clusters point to and inline their current
+    content in the prompt, so the agent doesn't spend its first N tool calls
+    just re-reading files it already knows -- from the cluster data -- it
+    needs to fix. Confined to compile_fix.py (langgraph-only): prompt_builder.py
+    is shared with the legacy cursor-agent engine and its fix_prompt() is
+    deliberately token-budgeted for that engine's own native file access, so
+    it's left untouched here."""
+    spring_repo = spring_repo.resolve()
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for c in clusters:
+        candidates = [c.representative.get("file")] + list(c.affected_files or [])
+        for raw in candidates:
+            if not raw or len(paths) >= _MAX_INLINE_FILES:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = spring_repo / raw
+            try:
+                p = p.resolve()
+            except OSError:
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                p.relative_to(spring_repo)
+            except ValueError:
+                continue  # outside the spring repo -- don't inline
+            paths.append(p)
+
+    sections = []
+    for p in paths:
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(content) > _MAX_INLINE_FILE_CHARS:
+            content = content[:_MAX_INLINE_FILE_CHARS] + "\n... (truncated)"
+        sections.append(f"--- current content of {p} ---\n{content}")
+
+    if not sections:
+        return ""
+    return "\n\nCurrent file contents (already read for you -- no need to read_file these again):\n\n" + "\n\n".join(
+        sections
+    )
+
 
 def _clusters_from_dicts(cluster_dicts: list[dict[str, Any]]):
     from error_clusterer import ErrorCluster  # scripts/ on sys.path via package __init__
@@ -51,7 +103,7 @@ def run_compile_fix(
     )
     clusters = _clusters_from_dicts(cluster_dicts)
     system = builder.system_prompt()
-    user = builder.fix_prompt(clusters, config.spring_repo)
+    user = builder.fix_prompt(clusters, config.spring_repo) + _inline_affected_files(config.spring_repo, clusters)
 
     model_name = config.choose_model(TaskSignals(retry_count=retry_count, item_count=len(clusters)))
     model = model_override if model_override is not None else make_model(config, model_name)
@@ -65,6 +117,8 @@ def run_compile_fix(
         user=user,
         max_tool_calls=config.max_agent_tool_calls,
         config=config,
+        model_name=model_name,
+        phase="compile_fix",
     )
     append_usage_log(
         config,

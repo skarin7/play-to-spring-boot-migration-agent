@@ -136,7 +136,13 @@ def run_setup_sh(
     setup_sh = scripts_dir() / "setup.sh"
     if not setup_sh.is_file():
         return False, f"kit install script missing at {setup_sh}"
-    cmd = ["bash", str(setup_sh), str(play_repo), "--workspace", str(workspace_dir)]
+    # langgraph engine never shells out to cursor-agent, so skip installing
+    # .cursor/skills, .cursor/settings.json, and the cursor-agent-specific
+    # "Next steps" block that setup.sh prints (that's legacy-engine-only).
+    cmd = [
+        "bash", str(setup_sh), str(play_repo),
+        "--workspace", str(workspace_dir), "--skip-cursor-setup",
+    ]
     if spring_name:
         cmd.extend(["--spring-name", spring_name])
     if dry_run:

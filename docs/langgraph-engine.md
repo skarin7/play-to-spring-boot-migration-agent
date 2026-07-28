@@ -2,7 +2,7 @@
 
 `play-to-spring-kit/agent/` is the LangGraph-based rewrite of the Play →
 Spring Boot migration orchestrator. It replaces the imperative
-`scripts/migration_orchestrator.py` (the "legacy" engine, still available
+`scripts/legacy/migration_orchestrator.py` (the "legacy" engine, still available
 via `--engine legacy`) with an explicit state graph: deterministic steps are
 plain graph nodes, and LLM calls are bounded, path-jailed agent nodes that
 never invoke each other directly — every LLM edit is verified by the next
@@ -170,6 +170,35 @@ repeated JAR invocations or LLM calls for work already done.
 not under `.migration/`) is a **derived, human-readable artifact** written
 after every run for people/tools reading it — never read back to resume a
 run once a checkpoint exists.
+
+### LLM call logs
+
+Every `run_tool_loop` call (bootstrap, compile-fix, routes, config-mapping,
+runtime-wiring) writes two things, neither gated by `--verbose`:
+
+- Console (`agent.llm` logger, `INFO` — visible by default): one line per
+  round/tool-call, tagged `[<phase>/<request_id>]` (e.g.
+  `[bootstrap/c1f7a6ce]`) so every line from one `run_tool_loop` call shares
+  the same `request_id`. Includes model, token counts, tool name, and for
+  `read_file`/`write_file`/`str_replace` the `path` being touched. The first
+  line of each call also prints the debug file path (below). Kept short —
+  no full prompt/tool-output text on stdout.
+- `<spring-repo>/.migration/llm-debug.jsonl` — one JSON record per
+  round/tool-call with the **full** system/user prompt, tool call args, and
+  tool output, tagged with the same `request_id` as the console lines
+  (`grep <request_id> llm-debug.jsonl` pulls the full detail behind one
+  console line). Also has `finish` / `cap_reached` events explaining why a
+  loop stopped.
+- `<spring-repo>/.migration/llm-usage.jsonl` — one summary record per agent
+  attempt (model, llm_requests, tool_calls, tokens, compactions); unrelated
+  to `request_id`, already existed before the per-round logging above.
+
+`llm-debug.jsonl` necessarily contains full Spring source file contents (the
+same content the tool loop already sent to the LLM API via `read_file` —
+there's no way to have an editing agent reason about code without that,
+inherent to every file-editing LLM agent). `setup.sh` appends `.migration/`
+to `<spring-repo>/.gitignore` (creating it if missing) so this never lands in
+the customer's Spring repo's git history.
 
 ### Adopting a legacy run
 

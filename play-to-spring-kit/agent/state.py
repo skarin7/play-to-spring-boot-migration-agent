@@ -88,6 +88,12 @@ class MigrationState(TypedDict, total=False):
     last_clusters: list[dict[str, Any]]
     last_edited_files: list[str]
     det_fixed_last_round: int
+    # Set by the compile-fix agent itself via the flag_for_manual_review tool
+    # (tools/fs.py) when it determines the failure needs a redesign, not an
+    # incremental fix -- e.g. a library with no Spring/Jakarta equivalent.
+    # Preferred over the deterministic unmappable_framework_packages() guess
+    # in slice_finalize_node's _manual_intervention_note.
+    agent_manual_review_reason: str | None
 
     # routing / terminal (current slice)
     guard_decision: GuardDecision

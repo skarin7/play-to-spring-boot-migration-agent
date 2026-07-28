@@ -81,6 +81,8 @@ def run_config_mapping_agent(
         user=_user_prompt(leftover),
         max_tool_calls=config.max_agent_tool_calls,
         config=config,
+        model_name=model_name,
+        phase="config_mapping",
     )
     append_usage_log(
         config,

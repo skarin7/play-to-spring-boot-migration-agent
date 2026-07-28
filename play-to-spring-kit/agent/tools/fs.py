@@ -14,6 +14,11 @@ from langchain_core.tools import BaseTool, tool
 
 MAX_READ_CHARS = 40_000
 
+# run_tool_loop (agent/llm.py) recognizes this prefix on any tool's output
+# and stops the loop early, capturing the rest as ToolLoopResult.manual_review_reason
+# -- a generic convention, not coupled to FsJail specifically.
+MANUAL_REVIEW_PREFIX = "MANUAL_REVIEW_REQUESTED: "
+
 
 class FsJail:
     def __init__(self, spring_repo: Path, play_repo: Path | None = None) -> None:
@@ -97,4 +102,16 @@ class FsJail:
             entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name))
             return "\n".join(f"{e.name}/" if e.is_dir() else e.name for e in entries[:200])
 
-        return [read_file, write_file, str_replace, list_dir]
+        @tool
+        def flag_for_manual_review(reason: str) -> str:
+            """Call this INSTEAD of attempting further edits when you determine
+            the failing code depends on a library/pattern with no Spring or
+            Jakarta EE equivalent (e.g. an actor/reactive-streams framework
+            like Akka/Pekko, a server-side templating engine, a DI framework
+            with no drop-in replacement) -- so it needs a real redesign, not
+            an incremental import/symbol fix. Explain specifically what's
+            incompatible and, if you can tell, what a Spring-idiomatic
+            replacement would look like. Stop editing after calling this."""
+            return f"{MANUAL_REVIEW_PREFIX}{reason}"
+
+        return [read_file, write_file, str_replace, list_dir, flag_for_manual_review]

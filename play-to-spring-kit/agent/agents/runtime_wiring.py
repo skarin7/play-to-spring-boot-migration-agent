@@ -106,6 +106,8 @@ def run_runtime_wiring_agent(
         user=_user_prompt(boot_log_tail),
         max_tool_calls=config.max_agent_tool_calls,
         config=config,
+        model_name=model_name,
+        phase="runtime_wiring",
     )
     append_usage_log(
         config,
