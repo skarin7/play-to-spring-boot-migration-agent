@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import AgentConfig
+from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
 
@@ -53,7 +53,7 @@ def run_compile_fix(
     system = builder.system_prompt()
     user = builder.fix_prompt(clusters, config.spring_repo)
 
-    model_name = config.model_for_retry(retry_count)
+    model_name = config.choose_model(TaskSignals(retry_count=retry_count, item_count=len(clusters)))
     model = model_override if model_override is not None else make_model(config, model_name)
 
     jail = FsJail(config.spring_repo, config.play_repo)
