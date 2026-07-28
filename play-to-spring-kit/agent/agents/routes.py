@@ -3,8 +3,9 @@
 Play ``conf/routes`` maps HTTP routes to controller methods; the toolkit JAR
 migrates the method bodies but never adds the Spring routing annotations
 (docs/play_to_spring_migration.md 6.4/7.1: "routes | @RestController +
-@*Mapping"). This is low-stakes, mechanical annotation work — cheap tier
-only, no escalation (unlike the compile-fix agent's two-tier retry ladder).
+@*Mapping"). Model tier is picked by config.choose_model: escalates to
+premium on repeated retries or a large unmapped-route count (see
+docs/superpowers/specs/2026-07-27-heuristic-model-router-design.md).
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import AgentConfig
+from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
 
@@ -62,7 +63,8 @@ def run_routes_agent(
     model_override: Any = None,
 ) -> tuple[list[Path], ToolLoopResult]:
     """One routes-mapping round. Returns (edited files, loop result)."""
-    model = model_override if model_override is not None else make_model(config, config.model_cheap)
+    model_name = config.choose_model(TaskSignals(retry_count=attempt - 1, item_count=len(unmapped)))
+    model = model_override if model_override is not None else make_model(config, model_name)
 
     jail = FsJail(config.spring_repo, config.play_repo)
     started = time.time()
@@ -80,7 +82,7 @@ def run_routes_agent(
             "ts": started,
             "phase": "routes",
             "attempt": attempt,
-            "model": config.model_cheap,
+            "model": model_name,
             "unmapped_count": len(unmapped),
             "llm_requests": result.llm_requests,
             "tool_calls": result.tool_calls,
