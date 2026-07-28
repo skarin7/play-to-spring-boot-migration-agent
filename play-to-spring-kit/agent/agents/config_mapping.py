@@ -5,9 +5,10 @@
 verbatim (dot-keys, e.g. ``mongodb.uri=...``) but never renames them to
 Spring's own idiomatic property names (e.g. ``spring.data.mongodb.uri``).
 ``tools/config_mapping.py``'s seed table already resolves the well-known
-cases deterministically; this agent handles everything else -- low-stakes,
-mechanical work, cheap tier only, no escalation (same rationale as the
-routes agent, agent/agents/routes.py).
+cases deterministically; this agent handles everything else. Model tier is
+picked by config.choose_model: escalates to premium on repeated retries or a
+large leftover-key count (see docs/superpowers/specs/
+2026-07-27-heuristic-model-router-design.md).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import AgentConfig
+from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.config_mapping import SEED_KEY_MAP
 from ..tools.fs import FsJail
@@ -67,7 +68,8 @@ def run_config_mapping_agent(
     model_override: Any = None,
 ) -> tuple[list[Path], ToolLoopResult]:
     """One config-mapping round. Returns (edited files, loop result)."""
-    model = model_override if model_override is not None else make_model(config, config.model_cheap)
+    model_name = config.choose_model(TaskSignals(retry_count=attempt - 1, item_count=len(leftover)))
+    model = model_override if model_override is not None else make_model(config, model_name)
 
     jail = FsJail(config.spring_repo, config.play_repo)
     started = time.time()
@@ -86,7 +88,7 @@ def run_config_mapping_agent(
             "ts": started,
             "phase": "config_mapping",
             "attempt": attempt,
-            "model": config.model_cheap,
+            "model": model_name,
             "leftover_count": len(leftover),
             "llm_requests": result.llm_requests,
             "tool_calls": result.tool_calls,
