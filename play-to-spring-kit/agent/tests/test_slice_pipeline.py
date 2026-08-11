@@ -70,6 +70,75 @@ def test_budget_exhausted_aborts_before_second_slice(tmp_path):
     assert by_id["b"]["status"] == "pending"
 
 
+class FakeInventoryRunner:
+    def __init__(self, report):
+        self.report = report
+        self.calls = 0
+
+    def __call__(self, config):
+        self.calls += 1
+        return self.report
+
+
+def test_inventory_node_logs_paradigm_and_unknown_gaps_before_transform(tmp_path, caplog):
+    play_repo = tmp_path / "play"
+    (play_repo / "app").mkdir(parents=True)
+    spring_repo = tmp_path / "spring"
+    (spring_repo / "src" / "main" / "java").mkdir(parents=True)
+    (spring_repo / "src" / "main" / "java" / "Application.java").write_text("class Application {}")
+    (spring_repo / "src" / "main" / "resources").mkdir(parents=True)
+    (spring_repo / "src" / "main" / "resources" / "application.properties").write_text("")
+    (spring_repo / "pom.xml").write_text("<project></project>")
+    cfg = AgentConfig(spring_repo=spring_repo, play_repo=play_repo)
+    cfg.api_key = "test-key"
+    jar = FakeJarRunner()
+    fake_report = {
+        "coveragePercent": 50.0,
+        "knownCount": 1,
+        "unknownCount": 1,
+        "paradigmCount": 1,
+        "touchpoints": [
+            {"construct": "akka.actor.UntypedActor", "location": "WorkerActor.java:1", "classification": "PARADIGM"},
+            {"construct": "play.data.Form", "location": "SignupController.java:3", "classification": "UNKNOWN"},
+        ],
+    }
+    inv_runner = FakeInventoryRunner(fake_report)
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), jar_runner=jar, inventory_runner=inv_runner)
+    graph = build_graph(cfg, ctx).compile()
+    initial = {"spring_repo": str(cfg.spring_repo), "retry_count": 0, "total_llm_calls": 0}
+    with caplog.at_level("WARNING", logger="agent.nodes.slice_pipeline"):
+        graph.invoke(initial, config={"recursion_limit": recursion_limit(cfg)})
+    messages = " ".join(r.message for r in caplog.records)
+    assert "50.0" in messages
+    assert "akka.actor.UntypedActor" in messages
+    assert "play.data.Form" in messages
+
+
+def test_inventory_node_calls_inventory_runner_and_stores_report(tmp_path):
+    play_repo = tmp_path / "play"
+    (play_repo / "app").mkdir(parents=True)
+    spring_repo = tmp_path / "spring"
+    # Pre-scaffold so bootstrap_check_node skips straight to inventory (no real LLM call).
+    (spring_repo / "src" / "main" / "java").mkdir(parents=True)
+    (spring_repo / "src" / "main" / "java" / "Application.java").write_text("class Application {}")
+    (spring_repo / "src" / "main" / "resources").mkdir(parents=True)
+    (spring_repo / "src" / "main" / "resources" / "application.properties").write_text("")
+    (spring_repo / "pom.xml").write_text("<project></project>")
+    cfg = AgentConfig(spring_repo=spring_repo, play_repo=play_repo)
+    cfg.api_key = "test-key"
+    jar = FakeJarRunner()
+    fake_report = {"coveragePercent": 50.0, "knownCount": 1, "unknownCount": 0, "paradigmCount": 1, "touchpoints": []}
+    inv_runner = FakeInventoryRunner(fake_report)
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), jar_runner=jar, inventory_runner=inv_runner)
+    graph = build_graph(cfg, ctx).compile()
+    initial = {"spring_repo": str(cfg.spring_repo), "retry_count": 0, "total_llm_calls": 0}
+    final = graph.invoke(initial, config={"recursion_limit": recursion_limit(cfg)})
+    assert final["play_surface_inventory"] == fake_report
+    assert inv_runner.calls == 1
+
+
 def test_one_slice_fails_other_succeeds_yields_slice_failure_exit_code(tmp_path):
     cfg = make_config(tmp_path, max_retries_per_layer=0)
     units = [default_unit_entry("a", "a", 0), default_unit_entry("b", "b", 0)]

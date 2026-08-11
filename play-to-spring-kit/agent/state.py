@@ -102,6 +102,10 @@ class MigrationState(TypedDict, total=False):
 
     # slice pipeline (M2)
     source_inventory: dict[str, Any] | None
+    # Pre-flight Play-surface scan (java-dev-toolkit `inventory` subcommand): per-touchpoint
+    # KNOWN/UNKNOWN/PARADIGM classification + coveragePercent, run once before the first
+    # slice transform. None when no play_repo/jar (no signal, not a failure).
+    play_surface_inventory: dict[str, Any] | None
     migration_units: list[UnitState]
     current_unit_idx: int
     migration_verification: dict[str, Any] | None
