@@ -37,7 +37,8 @@ import java.util.stream.Stream;
         DevToolkitCLI.InventoryCommand.class,
         DevToolkitCLI.MigrateAppCommand.class,
         DevToolkitCLI.GeneratePromptsCommand.class,
-        DevToolkitCLI.UndoChangesCommand.class
+        DevToolkitCLI.UndoChangesCommand.class,
+        DevToolkitCLI.SignatureCommand.class
     }
 )
 public class DevToolkitCLI implements Callable<Integer> {
@@ -705,6 +706,52 @@ public class DevToolkitCLI implements Callable<Integer> {
             } catch (Exception e) {
                 System.err.println("❌ Error during undo operation: " + e.getMessage());
                 e.printStackTrace();
+                return 1;
+            }
+        }
+    }
+
+    /**
+     * Signature Command - emit structural signatures for migration verification
+     */
+    @Command(
+        name = "signature",
+        description = "Emit structural signatures (methods, arity, visibility, statement counts) as JSON"
+    )
+    static class SignatureCommand implements Callable<Integer> {
+
+        @Parameters(index = "0", description = "Java file or source directory to analyze")
+        private String input;
+
+        @Option(names = {"-o", "--output"}, description = "Write JSON here (default: stdout)")
+        private String output;
+
+        @Override
+        public Integer call() throws Exception {
+            try {
+                Path target = Paths.get(input);
+                if (!Files.exists(target)) {
+                    System.err.println("Input not found: " + target);
+                    return 1;
+                }
+                String json = SignatureExtractor.toJson(
+                    Files.isDirectory(target)
+                        ? SignatureExtractor.extractTree(target)
+                        : SignatureExtractor.extractFile(
+                            target,
+                            target.getFileName().toString())
+                );
+                // JSON goes to stdout clean, so it can be piped straight into
+                // signature_diff.py without stripping progress chatter.
+                if (output == null) {
+                    System.out.println(json);
+                } else {
+                    Files.write(Paths.get(output), json.getBytes());
+                    System.err.println("Signatures written to " + output);
+                }
+                return 0;
+            } catch (Exception e) {
+                System.err.println("Error extracting signatures: " + e.getMessage());
                 return 1;
             }
         }
