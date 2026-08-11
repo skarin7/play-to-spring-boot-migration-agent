@@ -47,6 +47,28 @@ def _manual_intervention_note(state: MigrationState) -> str | None:
     )
 
 
+def _log_play_surface_inventory(report: dict | None) -> None:
+    """Surfaces the pre-flight scan's coverage/PARADIGM/UNKNOWN findings before any slice is
+    transformed -- the point of Phase A: a known gap discovered up front, not a broken build.
+    Gaps are logged at WARNING (not just recorded in state) so a headless run's own log makes
+    the coverage picture visible without requiring a caller to inspect state after the fact."""
+    if not report:
+        return
+    coverage = report.get("coveragePercent") or 0.0
+    paradigm = report.get("paradigmCount", 0) or 0
+    unknown = report.get("unknownCount", 0) or 0
+    if not (paradigm or unknown):
+        LOG.info("play-surface inventory: %.1f%% coverage, no gaps found", coverage)
+        return
+    LOG.warning(
+        "play-surface inventory: %.1f%% coverage, %d paradigm, %d unknown construct(s) found before transform",
+        coverage, paradigm, unknown,
+    )
+    for t in report.get("touchpoints", []):
+        if t.get("classification") in ("PARADIGM", "UNKNOWN"):
+            LOG.warning("  [%s] %s @ %s", t.get("classification"), t.get("construct"), t.get("location"))
+
+
 def route_after_inventory(state: MigrationState) -> str:
     return "router" if state.get("migration_units") else "no_slices"
 
@@ -126,7 +148,15 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         source_inventory = inventory.scan_play_java(config.play_repo)
         discovered = inventory.discover_migration_units(config.play_repo)
         units = inventory.merge_discovered_migration_units(None, discovered)
-        return {"migration_units": units, "source_inventory": source_inventory}
+        play_surface_inventory = None
+        if ctx.inventory_runner is not None:
+            play_surface_inventory = ctx.inventory_runner(config)
+            _log_play_surface_inventory(play_surface_inventory)
+        return {
+            "migration_units": units,
+            "source_inventory": source_inventory,
+            "play_surface_inventory": play_surface_inventory,
+        }
 
     def transform_node(state: MigrationState) -> dict:
         idx = state["current_unit_idx"]

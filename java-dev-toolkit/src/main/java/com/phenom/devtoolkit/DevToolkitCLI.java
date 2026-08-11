@@ -34,6 +34,7 @@ import java.util.stream.Stream;
         DevToolkitCLI.VerifyCommand.class,
         DevToolkitCLI.IntrospectCommand.class,
         DevToolkitCLI.TransformCommand.class,
+        DevToolkitCLI.InventoryCommand.class,
         DevToolkitCLI.MigrateAppCommand.class,
         DevToolkitCLI.GeneratePromptsCommand.class,
         DevToolkitCLI.UndoChangesCommand.class
@@ -252,6 +253,61 @@ public class DevToolkitCLI implements Callable<Integer> {
                 return 0;
             } catch (Exception e) {
                 System.err.println("❌ Error during transform: " + e.getMessage());
+                e.printStackTrace();
+                return 1;
+            }
+        }
+    }
+
+    /**
+     * Inventory Command - Pre-flight scan of the Play API surface a project actually uses.
+     * Run before {@code migrate-app} so coverage gaps (UNKNOWN/PARADIGM constructs, e.g. Akka
+     * actors) are known up front instead of discovered as a broken build later.
+     */
+    @Command(
+        name = "inventory",
+        description = "Scan a Play project's API surface and classify each touchpoint KNOWN/UNKNOWN/PARADIGM"
+    )
+    static class InventoryCommand implements Callable<Integer> {
+
+        @Option(names = {"--source"}, description = "Play repo root (default: .)")
+        private String source = ".";
+
+        @Option(names = {"--report"}, description = "Optional JSON report path")
+        private String reportPath;
+
+        @Override
+        public Integer call() throws Exception {
+            try {
+                Path sourcePath = Paths.get(source).toAbsolutePath().normalize();
+                PlaySurfaceInventory.Report report = new PlaySurfaceInventory().scanTree(sourcePath);
+
+                if (reportPath != null && !reportPath.trim().isEmpty()) {
+                    Path report_ = Paths.get(reportPath).toAbsolutePath().normalize();
+                    Files.createDirectories(report_.getParent());
+                    new ObjectMapper().writerWithDefaultPrettyPrinter().writeValue(report_.toFile(), report);
+                    System.out.println("Wrote report: " + report_);
+                }
+
+                System.out.printf(
+                        "✅ inventory done: %d files, %d known, %d unknown, %d paradigm, %.1f%% coverage%n",
+                        report.filesScanned, report.knownCount, report.unknownCount, report.paradigmCount,
+                        report.coveragePercent);
+                if (report.paradigmCount > 0) {
+                    System.out.println("⚠️  PARADIGM constructs found (no Spring equivalent — needs a human decision):");
+                    report.touchpoints.stream()
+                            .filter(t -> PlaySurfaceInventory.PARADIGM.equals(t.classification))
+                            .forEach(t -> System.out.println("   " + t.construct + " @ " + t.location));
+                }
+                if (report.unknownCount > 0) {
+                    System.out.println("ℹ️  UNKNOWN constructs found (no toolkit rule yet):");
+                    report.touchpoints.stream()
+                            .filter(t -> PlaySurfaceInventory.UNKNOWN.equals(t.classification))
+                            .forEach(t -> System.out.println("   " + t.construct + " @ " + t.location));
+                }
+                return 0;
+            } catch (Exception e) {
+                System.err.println("❌ Error during inventory: " + e.getMessage());
                 e.printStackTrace();
                 return 1;
             }
@@ -492,6 +548,20 @@ public class DevToolkitCLI implements Callable<Integer> {
                     continue;
                 }
 
+                List<PlaySurfaceInventory.Touchpoint> gaps = findGapTouchpoints(p);
+                if (!gaps.isEmpty()) {
+                    PlayToSpringTransformer.TransformResult skip = new PlayToSpringTransformer.TransformResult();
+                    skip.input = p.toString();
+                    skip.layer = detectedLayer.name().toLowerCase();
+                    for (PlaySurfaceInventory.Touchpoint gap : gaps) {
+                        skip.warnings.add(PlaySurfaceInventory.GAP_SKIP_PREFIX + gap.classification + ": "
+                                + gap.construct + " @ " + gap.location + " -- no Spring mapping, needs manual migration");
+                    }
+                    results.add(skip);
+                    System.out.println("  [" + treeLabel + "] " + rel + ": " + skip.warnings);
+                    continue;
+                }
+
                 if (dryRun) {
                     System.out.println("Would transform [" + treeLabel + "] " + rel + " -> " + outPath
                             + " (layer=" + detectedLayer + ")");
@@ -513,6 +583,22 @@ public class DevToolkitCLI implements Callable<Integer> {
                     err.errors.add(e.getMessage());
                     results.add(err);
                 }
+            }
+        }
+
+        /**
+         * Touchpoints migrate-app should NOT silently transform through: PARADIGM (no Spring
+         * structural equivalent, e.g. Akka actors) and UNKNOWN (no toolkit rule yet). Whole-file
+         * granularity -- a file with any such touchpoint is skipped entirely rather than partially
+         * transformed, so migrate-app never hands the compile-fix loop a file it can't finish.
+         */
+        private List<PlaySurfaceInventory.Touchpoint> findGapTouchpoints(Path file) {
+            try {
+                return new PlaySurfaceInventory().scanFile(file).stream()
+                        .filter(t -> !PlaySurfaceInventory.KNOWN.equals(t.classification))
+                        .collect(java.util.stream.Collectors.toList());
+            } catch (IOException e) {
+                return java.util.Collections.emptyList();
             }
         }
 

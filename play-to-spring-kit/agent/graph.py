@@ -137,6 +137,7 @@ from .tools.maven import BootResult
 
 JarRunner = Callable[[AgentConfig, str], "tuple[int, int]"]
 BootRunner = Callable[[AgentConfig], BootResult]
+InventoryRunner = Callable[[AgentConfig], "dict[str, Any] | None"]
 
 
 @dataclass
@@ -151,6 +152,7 @@ class RuntimeCtx:
     setup_ops: Any = None
     bootstrap_model_override: Any = None
     boot_runner: BootRunner | None = None
+    inventory_runner: InventoryRunner | None = None
 
 
 def _default_jar_runner(config: AgentConfig, path_prefix: str) -> tuple[int, int]:
@@ -168,6 +170,20 @@ def _default_jar_runner(config: AgentConfig, path_prefix: str) -> tuple[int, int
     )
 
 
+def _default_inventory_runner(config: AgentConfig) -> "dict[str, Any] | None":
+    """Pre-flight Play-surface scan, run once before the first slice transform.
+
+    Returns None (no signal, not a failure) if there's no play_repo/jar to scan with --
+    callers must treat a missing report the same as an empty one, never abort on it.
+    """
+    from .tools.toolkit_inventory import run_inventory_scan
+
+    if config.play_repo is None or config.jar_path is None or not config.jar_path.is_file():
+        return None
+    report_path = config.migration_dir / "play-surface-inventory.json"
+    return run_inventory_scan(config.play_repo, config.jar_path, report_path, config.dry_run)
+
+
 def default_ctx(config: AgentConfig) -> RuntimeCtx:
     from compile_error_fixer import CompileErrorFixer
     from error_clusterer import ErrorClusterer
@@ -183,6 +199,7 @@ def default_ctx(config: AgentConfig) -> RuntimeCtx:
         jar_runner=_default_jar_runner,
         setup_ops=SetupOps(),
         boot_runner=lambda cfg: run_spring_boot(cfg.spring_repo, cfg.boot_timeout_sec, cfg.dry_run),
+        inventory_runner=_default_inventory_runner,
     )
 
 
