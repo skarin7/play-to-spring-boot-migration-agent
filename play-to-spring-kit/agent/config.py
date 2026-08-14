@@ -39,9 +39,10 @@ class AgentConfig:
     headless: bool = True
     dry_run: bool = False
 
-    # Setup phase (M3): toolkit build + kit setup.sh + optional conf export.
+    # Setup phase (M3): toolkit jar + kit setup.sh + optional conf export.
     toolkit_root: Path | None = None
     skip_build_toolkit: bool = False
+    build_toolkit_from_source: bool = False
     workspace_dir: Path | None = None
     spring_name: str | None = None
     export_play_conf: bool = False

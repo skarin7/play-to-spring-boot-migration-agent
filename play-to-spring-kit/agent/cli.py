@@ -72,7 +72,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--skip-build-toolkit",
         action="store_true",
-        help="require an existing JAR in play-to-spring-kit/lib/ instead of building it",
+        help="require an existing JAR in play-to-spring-kit/lib/ instead of fetching/building it",
+    )
+    p.add_argument(
+        "--build-toolkit-from-source",
+        action="store_true",
+        help="build java-dev-toolkit with mvn instead of fetching the pinned release jar "
+        "(for toolkit developers testing unreleased changes)",
     )
     p.add_argument("--export-play-conf", action="store_true")
     p.add_argument("--conf-strip-prefix", action="append", default=[], metavar="PREFIX")
@@ -95,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         spring_name=args.spring_name,
         toolkit_root=args.toolkit_root,
         skip_build_toolkit=args.skip_build_toolkit,
+        build_toolkit_from_source=args.build_toolkit_from_source,
         export_play_conf=args.export_play_conf,
         conf_strip_prefixes=list(args.conf_strip_prefix or []),
         max_bootstrap_attempts=args.max_bootstrap_attempts,

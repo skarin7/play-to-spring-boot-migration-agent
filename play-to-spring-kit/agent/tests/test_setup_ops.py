@@ -39,9 +39,54 @@ def test_ensure_jar_skip_build_fails_without_existing_jar(tmp_path, monkeypatch)
     assert "no JAR found" in msg
 
 
+def test_ensure_jar_fetches_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_ops, "kit_root", lambda: tmp_path / "kit")
+    fetched = []
+
+    def fake_fetch(release_file, cache_dir):
+        fetched.append((release_file, cache_dir))
+        jar = cache_dir / "dev-toolkit-1.0.0.jar"
+        jar.parent.mkdir(parents=True, exist_ok=True)
+        jar.write_text("jar-bytes")
+        return jar
+
+    ok, msg = setup_ops.ensure_jar_in_kit_lib(
+        skip_build=False, toolkit_root=tmp_path / "unused", dry_run=False, fetch=fake_fetch
+    )
+    assert ok
+    assert "Fetched" in msg
+    assert fetched == [(tmp_path / "kit" / "toolkit-release.json", tmp_path / "kit" / "lib")]
+
+
+def test_ensure_jar_fetch_failure_propagates(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_ops, "kit_root", lambda: tmp_path / "kit")
+
+    def fake_fetch(release_file, cache_dir):
+        raise SystemExit("ERROR: sha256 mismatch")
+
+    ok, msg = setup_ops.ensure_jar_in_kit_lib(
+        skip_build=False, toolkit_root=tmp_path / "unused", dry_run=False, fetch=fake_fetch
+    )
+    assert not ok
+    assert "sha256 mismatch" in msg
+
+
+def test_ensure_jar_dry_run_skips_fetch(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_ops, "kit_root", lambda: tmp_path / "kit")
+
+    def fake_fetch(release_file, cache_dir):
+        raise AssertionError("fetch should not be called during a dry run")
+
+    ok, msg = setup_ops.ensure_jar_in_kit_lib(
+        skip_build=False, toolkit_root=tmp_path / "unused", dry_run=True, fetch=fake_fetch
+    )
+    assert ok
+    assert "dry-run" in msg
+
+
 def test_ensure_jar_missing_toolkit_root_fails(tmp_path):
     ok, msg = setup_ops.ensure_jar_in_kit_lib(
-        skip_build=False, toolkit_root=tmp_path / "nope", dry_run=False
+        skip_build=False, toolkit_root=tmp_path / "nope", dry_run=False, build_from_source=True
     )
     assert not ok
     assert "not found" in msg
@@ -55,7 +100,11 @@ def test_ensure_jar_builds_and_copies(tmp_path, monkeypatch):
     (toolkit_root / "target" / "dev-toolkit-1.0.0.jar").write_text("jar-bytes")
     runner, calls = fake_runner(returncode=0)
     ok, msg = setup_ops.ensure_jar_in_kit_lib(
-        skip_build=False, toolkit_root=toolkit_root, dry_run=False, runner=runner
+        skip_build=False,
+        toolkit_root=toolkit_root,
+        dry_run=False,
+        build_from_source=True,
+        runner=runner,
     )
     assert ok
     assert (tmp_path / "kit" / "lib" / "dev-toolkit-1.0.0.jar").is_file()
@@ -68,7 +117,11 @@ def test_ensure_jar_build_failure(tmp_path):
     (toolkit_root / "pom.xml").write_text("<project/>")
     runner, _ = fake_runner(returncode=1)
     ok, msg = setup_ops.ensure_jar_in_kit_lib(
-        skip_build=False, toolkit_root=toolkit_root, dry_run=False, runner=runner
+        skip_build=False,
+        toolkit_root=toolkit_root,
+        dry_run=False,
+        build_from_source=True,
+        runner=runner,
     )
     assert not ok
     assert "mvn package failed" in msg

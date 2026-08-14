@@ -1,4 +1,4 @@
-"""Deterministic setup subprocess wrappers: toolkit JAR build, kit setup.sh, config export.
+"""Deterministic setup subprocess wrappers: toolkit JAR fetch/build, kit setup.sh, config export.
 
 Copied from scripts/migration_orchestrator.py for byte-parity, decoupled from
 the legacy module:
@@ -8,8 +8,14 @@ the legacy module:
   run_setup_sh                (:406)
   run_export_play_conf        (:443)
 
-``runner`` is injectable (same convention as tools/toolkit_jar.py) so tests can
-script subprocess results without a real JDK/Maven/bash/pyhocon.
+``ensure_jar_in_kit_lib`` no longer vendors the jar's bytes in git nor builds
+it from source by default: it fetches the checksum-pinned release (see
+``toolkit-release.json`` / ``tools/fetch_jar.py``), same mechanism
+play-to-springboot uses. ``build_from_source=True`` opts back into the old
+``mvn package`` path for toolkit developers iterating on unreleased changes.
+
+``runner``/``fetch`` are injectable (same convention as tools/toolkit_jar.py)
+so tests can script subprocess/network results without a real JDK/Maven/network.
 """
 
 from __future__ import annotations
@@ -23,9 +29,12 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from . import fetch_jar
+
 LOG = logging.getLogger("agent.tools.setup_ops")
 
 RunCmd = Callable[[list[str], Path | None, bool], subprocess.CompletedProcess]
+FetchJar = Callable[[Path, Path], Path]
 
 
 def run_cmd(argv: list[str], cwd: Path | None, dry_run: bool) -> subprocess.CompletedProcess:
@@ -76,16 +85,27 @@ def find_packaged_toolkit_jar(toolkit_root: Path) -> Path | None:
     return jars[0]
 
 
+def toolkit_release_file() -> Path:
+    """Pinned {version, download_url, sha256} for the dev-toolkit jar."""
+    return kit_root() / "toolkit-release.json"
+
+
 def ensure_jar_in_kit_lib(
     *,
     skip_build: bool,
     toolkit_root: Path,
     dry_run: bool,
+    build_from_source: bool = False,
     runner: RunCmd = run_cmd,
+    fetch: FetchJar = fetch_jar.fetch,
 ) -> tuple[bool, str]:
     """
-    Build java-dev-toolkit and copy the JAR to play-to-spring-kit/lib/, or verify
-    lib/ already contains a JAR when skip_build is True.
+    Get the dev-toolkit JAR into play-to-spring-kit/lib/.
+
+    Default: fetch the checksum-pinned release jar (no JDK/Maven needed).
+    build_from_source=True builds java-dev-toolkit from the sibling checkout
+    instead. skip_build=True requires a JAR already present in lib/ and does
+    neither.
 
     Returns (ok, message).
     """
@@ -95,9 +115,18 @@ def ensure_jar_in_kit_lib(
         if not existing:
             return False, (
                 f"--skip-build-toolkit set but no JAR found in {lib_dir}. "
-                "Build the toolkit and copy dev-toolkit-*.jar there, or omit --skip-build-toolkit."
+                "Fetch/build the toolkit jar, or omit --skip-build-toolkit."
             )
         return True, f"Using existing JAR in {lib_dir}: {existing[0].name}"
+
+    if not build_from_source:
+        if dry_run:
+            return True, f"[dry-run] fetch checksum-pinned dev-toolkit jar -> {lib_dir}/"
+        try:
+            jar = fetch(toolkit_release_file(), lib_dir)
+        except SystemExit as e:
+            return False, str(e)
+        return True, f"Fetched {jar.name} -> {jar}"
 
     if not toolkit_root.is_dir():
         return False, (
@@ -193,10 +222,13 @@ class SetupOps:
 
     def ensure_jar(self, config) -> tuple[bool, str]:
         if config.play_repo is None:
-            return True, "no play_repo configured, skip toolkit build"
+            return True, "no play_repo configured, skip toolkit jar"
         toolkit_root = resolved_dev_toolkit_root(config.toolkit_root)
         return ensure_jar_in_kit_lib(
-            skip_build=config.skip_build_toolkit, toolkit_root=toolkit_root, dry_run=config.dry_run
+            skip_build=config.skip_build_toolkit,
+            toolkit_root=toolkit_root,
+            dry_run=config.dry_run,
+            build_from_source=config.build_toolkit_from_source,
         )
 
     def install(self, config) -> tuple[bool, str]:
