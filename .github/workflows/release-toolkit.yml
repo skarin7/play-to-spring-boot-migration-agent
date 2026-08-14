@@ -1,0 +1,81 @@
+name: Release java-dev-toolkit
+
+# Triggered by pushing a toolkit-v* tag, e.g.:
+#   cd java-dev-toolkit
+#   # bump <version> in pom.xml
+#   git commit -am "java-dev-toolkit: bump to 1.0.1"
+#   git tag toolkit-v1.0.1
+#   git push origin main toolkit-v1.0.1
+#
+# toolkit-v prefix (not v*) because this is a monorepo with other
+# components that may tag independently.
+
+on:
+  push:
+    tags:
+      - "toolkit-v*"
+
+# So a pushed tag that only touches other paths in the monorepo doesn't
+# publish a no-op release. GitHub still fires the tag-push event regardless
+# of which paths changed; this job checks the diff itself.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm the tag actually touches java-dev-toolkit/
+        id: scope
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | grep '^toolkit-v' | sed -n 2p)
+          if [ -n "$PREV_TAG" ]; then
+            CHANGED=$(git diff --name-only "$PREV_TAG" "${{ github.ref_name }}" -- java-dev-toolkit/ | head -1)
+          else
+            CHANGED="java-dev-toolkit/"
+          fi
+          if [ -z "$CHANGED" ]; then
+            echo "No changes under java-dev-toolkit/ since $PREV_TAG; skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 8
+        if: steps.scope.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+          cache-dependency-path: java-dev-toolkit/pom.xml
+
+      - name: Build and test
+        if: steps.scope.outputs.skip != 'true'
+        working-directory: java-dev-toolkit
+        run: mvn -B test package
+
+      - name: Compute checksum
+        if: steps.scope.outputs.skip != 'true'
+        id: checksum
+        working-directory: java-dev-toolkit/target
+        run: |
+          JAR=$(ls dev-toolkit-*.jar | grep -v original- | head -1)
+          sha256sum "$JAR" | tee "${JAR}.sha256"
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "java-dev-toolkit/target/${{ steps.checksum.outputs.jar }}" \
+            "java-dev-toolkit/target/${{ steps.checksum.outputs.jar }}.sha256" \
+            --generate-notes \
+            --title "java-dev-toolkit ${{ github.ref_name }}"
