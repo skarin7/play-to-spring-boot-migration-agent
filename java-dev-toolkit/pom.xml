@@ -7,7 +7,7 @@
     
     <groupId>com.platform</groupId>
     <artifactId>java-class-splitter</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     
     <properties>
         <maven.compiler.source>1.8</maven.compiler.source>
