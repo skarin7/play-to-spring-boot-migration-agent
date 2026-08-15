@@ -169,8 +169,41 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         unit["files_migrated"] = int(unit.get("files_migrated", 0)) + n_add
         if m_err:
             LOG.warning("migrate-app reported %d errors for slice %s", m_err, unit.get("id"))
+            # M6 Task 8: migrate-app itself reporting errors is a tool_error
+            # signal -- the toolkit JAR hit something it couldn't transform,
+            # which is exactly the class of blind spot the plugin's gap
+            # taxonomy exists to aggregate across installs.
+            from ..tools.gaps import record_gap
+
+            record_gap(
+                config.spring_repo,
+                "tool_error",
+                "migrate-app",
+                f"migrate-app reported {m_err} error(s) for slice {unit.get('id')!r} "
+                f"(path_prefix={unit.get('path_prefix', '')!r})",
+                role="dev",
+                layer=str(unit.get("id", "")),
+            )
         units[idx] = unit
-        return {"migration_units": units, "last_transform_added": n_add}
+
+        # M6 Task 7: fold this unit's journal (written per-batch by
+        # _default_jar_runner, inside migrate_until_done's loop) even though
+        # n_add above already has the same number in the normal case -- the
+        # fold is what makes a mid-loop crash recoverable on resume, not this
+        # call's own in-memory n_add. journal_offsets makes the fold
+        # idempotent across re-dispatches of the same unit (see
+        # tools/journal.py's module docstring for the bug this avoids).
+        from ..tools.journal import fold_journal
+
+        unit_key = str(unit.get("path_prefix", "")) or "app_root"
+        journal_offsets = dict(state.get("journal_offsets") or {})
+        _new_entries, updated_offsets = fold_journal(config.spring_repo, unit_key, journal_offsets)
+
+        return {
+            "migration_units": units,
+            "last_transform_added": n_add,
+            "journal_offsets": updated_offsets,
+        }
 
     def slice_finalize_node(state: MigrationState) -> dict:
         idx = state.get("current_unit_idx", 0)
@@ -202,6 +235,17 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             unit["status"] = "loop_detected"
             unit["failure_reason"] = "loop_detected"
             unit["manual_intervention_note"] = _manual_intervention_note(state)
+            # M6 Task 12: which case actually fired -- surfaced onto the unit
+            # record (and from there, into report.py's migration-units
+            # table) rather than only in the guard_node/det_fix log lines,
+            # so a human reading the report afterward can tell "genuinely
+            # stuck" from "the guard's error_count_spike branch mis-tripped
+            # on a fix that landed and exposed a different problem".
+            fingerprints = state.get("error_fingerprints", [])
+            if len(fingerprints) >= 2:
+                unit["stuck_vs_progress_reason"] = legacy_logic.stuck_vs_progress_reason(
+                    fingerprints[-1], fingerprints[:-1]
+                )
         elif outcome == "infrastructure_error":
             unit["status"] = "needs_manual_fix"
             unit["failure_reason"] = "infrastructure_error"
@@ -247,7 +291,44 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         migration_verification = inventory.run_verification(
             state.get("source_inventory"), config.spring_repo
         )
-        return {"migration_verification": migration_verification}
+
+        updates: dict = {"migration_verification": migration_verification}
+
+        # T4 (M6 Task 10): a test failure is a finding, never a halt -- same
+        # soft-finding model as T2 signatures and routes/config_mapping.
+        # Skipped entirely (not "ran and passed") when compile itself is
+        # still broken -- `mvn test` on a red build produces noise, not signal.
+        if config.run_tests and ctx.test_runner is not None and not final_result.errors:
+            test_result = ctx.test_runner(config)
+            findings = list(state.get("findings") or [])
+            if not test_result.all_passed:
+                findings.append(
+                    {
+                        "tier": "T4",
+                        "severity": "major",
+                        "category": "test_failure",
+                        "scope": "final",
+                        "passed": test_result.passed,
+                        "failed": test_result.failed,
+                        "errors": test_result.errors,
+                        "skipped": test_result.skipped,
+                        "log_tail": test_result.log_tail[-2000:],
+                    }
+                )
+                LOG.warning(
+                    "T4: mvn test reported %d failed, %d errors (passed=%d, skipped=%d)",
+                    test_result.failed, test_result.errors, test_result.passed, test_result.skipped,
+                )
+            updates["findings"] = findings
+            updates["test_result"] = {
+                "passed": test_result.passed,
+                "failed": test_result.failed,
+                "errors": test_result.errors,
+                "skipped": test_result.skipped,
+                "all_passed": test_result.all_passed,
+            }
+
+        return updates
 
     return {
         "inventory_node": inventory_node,

@@ -54,6 +54,24 @@ class ToolLoopResult:
     # redesign, not further incremental edits. Generic string-prefix
     # convention so run_tool_loop stays tool-set-agnostic (no FsJail import).
     manual_review_reason: str | None = None
+    # M6 Task 4: cache read/creation token totals, so the caching win is
+    # measured rather than assumed. Zero on a model/provider that doesn't
+    # report them, never an error -- these are a bonus signal, not a
+    # correctness requirement.
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    # M6 Task 5: total cost across every round of this loop, priced via
+    # pricing.cost_usd(model_name, ...). None when model_name has no
+    # rate-table entry -- distinct from 0.0 (a real, priced, zero-cost call
+    # can't happen, so None unambiguously means "unpriced", never "free").
+    total_cost_usd: float | None = 0.0
+
+
+def _cache_marked_content(text: str) -> list[dict[str, Any]]:
+    """One content block carrying an Anthropic cache_control breakpoint,
+    passed through OpenRouter. LangChain's message content accepts a list of
+    content blocks in this shape for providers that support it."""
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
 _COMPACT_INSTRUCTION = (
@@ -124,7 +142,85 @@ def compact_messages(messages: list[Any], config: AgentConfig) -> list[Any]:
         else str(summary_response.content)
     )
 
-    return head + [HumanMessage(content=f"[Earlier progress, compacted]\n{summary}")] + tail
+    # M6 Task 4/5: this model.invoke was previously an unmetered LLM side
+    # channel -- it costs real money and, unlike every other LLM call in this
+    # codebase, went through neither the usage log nor any budget counter.
+    # It still isn't counted against total_llm_calls (compaction is plumbing,
+    # not a fix-round attempt), but it must at least be visible in the same
+    # place every other call's cost shows up.
+    usage = getattr(summary_response, "usage_metadata", None) or {}
+    append_usage_log(
+        config,
+        {
+            "ts": time.time(),
+            "phase": "compact",
+            "model": config.model_cheap,
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        },
+    )
+
+    # M6 Task 12: previously the raw middle turns were dropped from
+    # `messages` forever, with only the (lossy, LLM-generated) summary
+    # surviving -- llm-debug.jsonl has each round's raw content, but nothing
+    # ever pointed back to it or made it retrievable in one place. Write the
+    # raw compacted-away span to its own file under .migration/compacted/ --
+    # already inside FsJail's writable/readable area (Task 6 widened it for
+    # decisions.md) -- and name that path in the synthetic summary message so
+    # the agent can read_file it back if the summary turns out to be missing
+    # something it needs.
+    span_path = _write_compacted_span(config, middle)
+    pointer = f" (full detail: {span_path})" if span_path else ""
+
+    return head + [
+        HumanMessage(content=f"[Earlier progress, compacted{pointer}]\n{summary}")
+    ] + tail
+
+
+def _write_compacted_span(config: AgentConfig, middle: list[Any]) -> str | None:
+    """Writes the raw (uncompacted) middle turns to a retrievable file.
+    Returns the path relative to spring_repo (what the agent should pass to
+    read_file), or None if the write itself fails -- compaction must still
+    succeed even if this best-effort archival step can't."""
+    try:
+        rel_dir = Path(".migration") / "compacted"
+        abs_dir = config.spring_repo / rel_dir
+        abs_dir.mkdir(parents=True, exist_ok=True)
+        rel_path = rel_dir / f"{uuid.uuid4().hex[:8]}.txt"
+        (config.spring_repo / rel_path).write_text(_render_messages_for_summary(middle), encoding="utf-8")
+        return str(rel_path)
+    except OSError:
+        return None
+
+
+# M6 Task 12: rough chars-per-token ratio for a pre-flight estimate, no
+# tokenizer dependency -- 4 is the commonly-cited average for English/code
+# mixed text across most tokenizers. This is deliberately conservative
+# (undercounts less than it overcounts) since the cost of a false positive
+# (compacting slightly early) is far cheaper than the cost of a false
+# negative (sending an oversized request anyway, which is the exact
+# post-hoc-only behavior this estimate exists to reduce).
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _estimate_tokens(messages: Sequence[Any]) -> int:
+    total_chars = 0
+    for m in messages:
+        content = m.content
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(str(block.get("text", block)))
+                else:
+                    total_chars += len(str(block))
+        else:
+            total_chars += len(str(content))
+        tool_calls = getattr(m, "tool_calls", None)
+        if tool_calls:
+            total_chars += len(str(tool_calls))
+    return total_chars // _CHARS_PER_TOKEN_ESTIMATE
 
 
 def _append_llm_debug(config: AgentConfig, request_id: str, record: dict[str, Any]) -> Path:
@@ -155,7 +251,18 @@ def run_tool_loop(
     """Run a bounded agentic loop: model <-> tools until no tool calls or cap hit."""
     tool_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     bound = model.bind_tools(list(tools)) if tools else model
-    messages: list[Any] = [SystemMessage(content=system), HumanMessage(content=user)]
+    # Prompt caching (M6 Task 4): both the system prompt and the user
+    # message's caller-assembled prefix (agents/compile_fix.py etc. put the
+    # stable part -- inlined file contents -- first specifically so this
+    # breakpoint lands after it) are marked cacheable. A model/provider that
+    # ignores cache_control simply pays the normal price; this never changes
+    # correctness, only cost.
+    if config.prompt_caching_enabled:
+        system_content: Any = _cache_marked_content(system)
+        user_content: Any = _cache_marked_content(user)
+    else:
+        system_content, user_content = system, user
+    messages: list[Any] = [SystemMessage(content=system_content), HumanMessage(content=user_content)]
     result = ToolLoopResult(final_text="")
     # "Round" = one run_tool_loop call, not one while-loop iteration: this
     # flag is set at most once for the whole call, so only the first budget
@@ -174,13 +281,68 @@ def run_tool_loop(
     )
 
     while True:
-        ai: AIMessage = bound.invoke(messages)
+        # Pre-flight compaction (M6 Task 12): the post-invoke check below
+        # catches an overflow only after that request was already built,
+        # sent, and billed. This estimate (char-count / 4, no tokenizer
+        # dependency -- see _estimate_tokens) runs BEFORE bound.invoke, so a
+        # transcript that's already over budget from the previous round's
+        # growth gets compacted before paying for the oversized request
+        # rather than after. Deliberately conservative: it only ever
+        # triggers compaction earlier than the post-invoke check would have,
+        # never instead of it -- the post-invoke check stays as the backstop
+        # for whatever the char-count heuristic underestimates.
+        estimated_tokens = _estimate_tokens(messages)
+        if estimated_tokens > config.max_agent_context_tokens:
+            do_compact = True
+            if not config.headless:
+                if not asked_this_round:
+                    asked_this_round = True
+                    decision = interrupt(
+                        {
+                            "reason": "context_budget_preflight",
+                            "estimated_tokens": estimated_tokens,
+                            "threshold": config.max_agent_context_tokens,
+                        }
+                    )
+                    normalized = decision if isinstance(decision, str) else str(decision)
+                    do_compact = normalized.strip().lower() != "continue"
+            if do_compact:
+                messages = compact_messages(messages, config)
+                result.compactions += 1
+                LOG.info(
+                    "tool loop pre-flight compacted: estimated_tokens=%d threshold=%d",
+                    estimated_tokens,
+                    config.max_agent_context_tokens,
+                )
+
+        # M6 Task 12 tracing: tags/metadata on each model.invoke, gated
+        # behind config.tracing_enabled so an untraced run pays zero cost
+        # for building this dict. request_id (this tool loop's own
+        # correlation id, already used to tag stdout/llm-debug.jsonl lines)
+        # is what lets a LangSmith trace for one round be matched back to
+        # the exact `grep request_id llm-debug.jsonl` line for its full
+        # prompt/tool-call detail.
+        invoke_kwargs: dict[str, Any] = {}
+        if config.tracing_enabled:
+            invoke_kwargs["config"] = {
+                "tags": [f"phase:{phase or 'unknown'}", f"request_id:{request_id}"],
+                "metadata": {"phase": phase, "request_id": request_id, "round": result.llm_requests + 1},
+                "run_name": f"{phase or 'llm'}-round-{result.llm_requests + 1}",
+            }
+        ai: AIMessage = bound.invoke(messages, **invoke_kwargs)
         result.llm_requests += 1
         usage = getattr(ai, "usage_metadata", None) or {}
         current_input_tokens = usage.get("input_tokens", 0)
         current_output_tokens = usage.get("output_tokens", 0)
         result.input_tokens += current_input_tokens
         result.output_tokens += current_output_tokens
+        # LangChain nests Anthropic-style cache token counts under
+        # input_token_details -- absent entirely on a provider/model that
+        # doesn't report them, which is fine: 0 is the correct "no signal"
+        # value here, not an error (M6 Task 4).
+        token_details = usage.get("input_token_details") or {}
+        result.cache_read_input_tokens += token_details.get("cache_read", 0)
+        result.cache_creation_input_tokens += token_details.get("cache_creation", 0)
         messages.append(ai)
 
         tool_calls = getattr(ai, "tool_calls", None) or []
@@ -263,6 +425,17 @@ def run_tool_loop(
                 )
 
     result.messages = messages
+    if model_name:
+        from . import pricing
+
+        result.total_cost_usd = pricing.cost_usd(
+            model_name,
+            result.input_tokens,
+            result.output_tokens,
+            cache_read_input_tokens=result.cache_read_input_tokens,
+        )
+    else:
+        result.total_cost_usd = None
     return result
 
 
@@ -270,7 +443,25 @@ UsageWriter = Callable[[dict[str, Any]], None]
 
 
 def append_usage_log(config: AgentConfig, record: dict[str, Any]) -> None:
-    """Append one usage record to <spring-repo>/.migration/llm-usage.json (JSONL)."""
+    """Append one usage record to <spring-repo>/.migration/llm-usage.json (JSONL).
+
+    M6 Task 5: attaches input_cost_usd/output_cost_usd/total_cost_usd here,
+    the single place every call site's record passes through, rather than at
+    each of the 6 append_usage_log call sites. Silently skipped (fields
+    simply absent) when the record has no "model"/"input_tokens" -- some
+    callers (compact_messages) may omit output_tokens; cost is None-safe.
+    """
+    from . import pricing
+
+    model_id = record.get("model")
+    input_tokens = record.get("input_tokens")
+    output_tokens = record.get("output_tokens")
+    if model_id and isinstance(input_tokens, int) and isinstance(output_tokens, int):
+        cache_read = record.get("cache_read_input_tokens", 0) or 0
+        cost = pricing.cost_usd(model_id, input_tokens, output_tokens, cache_read_input_tokens=cache_read)
+        if cost is not None:
+            record = {**record, "total_cost_usd": round(cost, 6)}
+
     path = config.migration_dir / "llm-usage.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:

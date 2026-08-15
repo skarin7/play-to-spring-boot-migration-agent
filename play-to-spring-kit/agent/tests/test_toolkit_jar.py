@@ -64,3 +64,28 @@ def test_migrate_until_done_dry_run_runs_once(tmp_path):
     runner, calls = fake_runner([])
     toolkit_jar.migrate_until_done(tmp_path, Path("j.jar"), tmp_path, None, True, runner=runner)
     assert len(calls) == 1
+
+
+def test_migrate_until_done_calls_on_batch_per_iteration(tmp_path):
+    """M6 Task 7: on_batch is the crash-recovery seam -- verify it fires
+    once per loop iteration, not once for the whole call, with each
+    iteration's own (n, m, remaining)."""
+    outputs = [
+        "migrate-app done: 2 files, 0 errors, 2 remaining",
+        "migrate-app done: 2 files, 1 errors, 0 remaining",
+    ]
+    runner, _ = fake_runner(list(outputs))
+    seen = []
+    toolkit_jar.migrate_until_done(
+        tmp_path, Path("j.jar"), tmp_path, None, False, runner=runner, on_batch=lambda n, m, r: seen.append((n, m, r))
+    )
+    assert seen == [(2, 0, 2), (2, 1, 0)]
+
+
+def test_migrate_until_done_dry_run_never_calls_on_batch(tmp_path):
+    runner, _ = fake_runner([])
+    seen = []
+    toolkit_jar.migrate_until_done(
+        tmp_path, Path("j.jar"), tmp_path, None, True, runner=runner, on_batch=lambda n, m, r: seen.append((n, m, r))
+    )
+    assert seen == []

@@ -30,12 +30,21 @@ MIGRATE_DONE_RE = re.compile(
 
 RunCmd = Callable[[list[str], Path | None, bool], subprocess.CompletedProcess]
 
+# A hung `java -jar` or `mvn` subprocess previously blocked the whole run
+# forever (timeout=None). No caller needs longer than this for a single JAR
+# invocation; migrate-app's own internal batching keeps individual calls well
+# under it in practice (M6 Task 2 sandboxing fix).
+DEFAULT_SUBPROCESS_TIMEOUT_SEC = 1800
+
 
 def run_cmd(argv: list[str], cwd: Path | None, dry_run: bool) -> subprocess.CompletedProcess:
     if dry_run:
         print("[dry-run]", " ".join(argv), file=sys.stderr)
         return subprocess.CompletedProcess(argv, 0, "", "")
-    return subprocess.run(argv, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=None)
+    return subprocess.run(
+        argv, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
+        timeout=DEFAULT_SUBPROCESS_TIMEOUT_SEC,
+    )
 
 
 def parse_migrate_output(text: str) -> tuple[int, int, int] | None:
@@ -81,8 +90,17 @@ def migrate_until_done(
     *,
     path_prefix: str | None = None,
     runner: RunCmd = run_cmd,
+    on_batch: Callable[[int, int, int], None] | None = None,
 ) -> tuple[int, int]:
-    """Returns (total_files_processed, total_errors)."""
+    """Returns (total_files_processed, total_errors).
+
+    on_batch(files_this_batch, errors_this_batch, remaining), if given, is
+    called after EVERY batch iteration of this loop -- not just once when the
+    whole call returns. This is the crash-recovery seam (M6 Task 7): the loop
+    below can run for many batches before returning, and a process killed
+    mid-loop otherwise loses every batch already completed, since the sqlite
+    checkpoint only advances at the containing graph node's boundary.
+    """
     total_n = 0
     total_m = 0
     prev_r = None
@@ -92,6 +110,8 @@ def migrate_until_done(
         )
         total_n += n
         total_m += m
+        if not dry_run and on_batch is not None:
+            on_batch(n, m, r)
         if dry_run:
             break
         if r < 0:

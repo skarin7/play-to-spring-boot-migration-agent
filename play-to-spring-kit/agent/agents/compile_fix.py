@@ -15,6 +15,7 @@ from typing import Any
 from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
+from .architect import DECISIONS_READ_FIRST_LINE
 
 LOG = logging.getLogger("agent.compile_fix")
 
@@ -102,20 +103,29 @@ def run_compile_fix(
         status_path=config.status_path,
     )
     clusters = _clusters_from_dicts(cluster_dicts)
-    system = builder.system_prompt()
-    user = builder.fix_prompt(clusters, config.spring_repo) + _inline_affected_files(config.spring_repo, clusters)
+    # Static text appended after PromptBuilder's own system prompt -- stays
+    # stable across every fix round in a slice, so it doesn't disturb the
+    # cache_control prefix (M6 Task 4/6).
+    system = builder.system_prompt() + DECISIONS_READ_FIRST_LINE
+    # Inlined file contents first, cluster/error text last (M6 Task 4): the
+    # file contents are the stable part across a slice's fix rounds -- the
+    # same files, re-read every round -- while the error clusters are what
+    # actually changes round to round. Prompt caching only pays off on a
+    # prefix that's identical across requests; putting the volatile part
+    # first (the old order) defeated caching on every single round.
+    user = _inline_affected_files(config.spring_repo, clusters) + "\n\n" + builder.fix_prompt(clusters, config.spring_repo)
 
     model_name = config.choose_model(TaskSignals(retry_count=retry_count, item_count=len(clusters)))
     model = model_override if model_override is not None else make_model(config, model_name)
 
-    jail = FsJail(config.spring_repo, config.play_repo)
+    jail = FsJail(config.spring_repo, config.play_repo, dry_run=config.dry_run)
     started = time.time()
     result = run_tool_loop(
         model=model,
-        tools=jail.build_tools(),
+        tools=jail.build_tools(phase="compile_fix"),
         system=system,
         user=user,
-        max_tool_calls=config.max_agent_tool_calls,
+        max_tool_calls=config.max_agent_tool_calls_for("compile_fix"),
         config=config,
         model_name=model_name,
         phase="compile_fix",
@@ -132,6 +142,7 @@ def run_compile_fix(
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
             "compactions": result.compactions,
             "edited_files": [str(p) for p in jail.edited_files],
         },

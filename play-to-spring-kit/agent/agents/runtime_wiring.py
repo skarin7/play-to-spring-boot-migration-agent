@@ -21,6 +21,7 @@ from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
 from ..tools.setup_ops import kit_root
+from .architect import DECISIONS_READ_FIRST_LINE
 
 LOG = logging.getLogger("agent.runtime_wiring")
 
@@ -40,7 +41,7 @@ symptoms and fixes for this exact class of problem follows -- use it when \
 the current failure matches a known pattern:
 
 {reference}
-"""
+""" + DECISIONS_READ_FIRST_LINE
 
 
 def _reference_slice(markdown: str) -> str | None:
@@ -96,15 +97,15 @@ def run_runtime_wiring_agent(
     )
     model = model_override if model_override is not None else make_model(config, model_name)
 
-    jail = FsJail(config.spring_repo, config.play_repo)
+    jail = FsJail(config.spring_repo, config.play_repo, dry_run=config.dry_run)
     started = time.time()
     system = SYSTEM_PROMPT.format(reference=load_runtime_wiring_reference())
     result = run_tool_loop(
         model=model,
-        tools=jail.build_tools(),
+        tools=jail.build_tools(phase="runtime_wiring"),
         system=system,
         user=_user_prompt(boot_log_tail),
-        max_tool_calls=config.max_agent_tool_calls,
+        max_tool_calls=config.max_agent_tool_calls_for("runtime_wiring"),
         config=config,
         model_name=model_name,
         phase="runtime_wiring",
@@ -120,6 +121,7 @@ def run_runtime_wiring_agent(
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
             "compactions": result.compactions,
             "edited_files": [str(p) for p in jail.edited_files],
         },

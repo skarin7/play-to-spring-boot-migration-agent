@@ -52,6 +52,20 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             }
         if decision == "attempts_exhausted":
             LOG.warning("runtime_wiring: giving up after %d attempts, app never started", attempts)
+            # M6 Task 8: recorded even though the run fails here -- a
+            # boot_failure gap is exactly the kind of thing worth aggregating
+            # across installs (see gap_report.py, not yet implemented in this
+            # phase but the data collection doesn't wait on the reader).
+            from ..tools.gaps import record_gap
+
+            record_gap(
+                config.spring_repo,
+                "boot_failure",
+                "spring-boot:run",
+                f"exhausted {attempts} runtime_wiring attempts; boot log tail: "
+                f"{state.get('boot_log_tail', '')[-500:]}",
+                role="dev",
+            )
             return {
                 "run_outcome": "runtime_wiring_failed",
                 "run_exit_code": RUN_OUTCOME_EXIT_CODES["runtime_wiring_failed"],
@@ -62,12 +76,13 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             # via make_model — degrade to a terminal outcome instead.
             LOG.warning("runtime_wiring: no API key configured, cannot invoke agent")
             return {"run_outcome": "no_llm", "run_exit_code": RUN_OUTCOME_EXIT_CODES["no_llm"]}
-        run_runtime_wiring_agent(
+        _edited, result = run_runtime_wiring_agent(
             config, state.get("boot_log_tail", ""), attempt=attempts + 1, model_override=ctx.model_override
         )
         return {
             "runtime_wiring_attempts": attempts + 1,
             "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+            "total_cost_usd": state.get("total_cost_usd", 0.0) + (result.total_cost_usd or 0.0),
         }
 
     return {

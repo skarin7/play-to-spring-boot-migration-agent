@@ -82,3 +82,40 @@ def test_priority_budget_before_loop(tmp_path):
     fp = ["A.java:1:x"]
     state = dict(BASE_STATE, total_llm_calls=1, error_fingerprints=[fp, fp])
     assert decide(state, cfg, now=1010.0) == "budget_exhausted"
+
+
+# ----------------------------------------------------------------------
+# Dollar budget (M6 Task 5): same precedence as the call-count budget, off
+# by default.
+# ----------------------------------------------------------------------
+
+
+def test_cost_budget_off_by_default(tmp_path):
+    cfg = make_config(tmp_path)
+    assert cfg.max_total_cost_usd == 0
+    state = dict(BASE_STATE, total_cost_usd=1_000_000.0)  # absurdly high, still ignored
+    assert decide(state, cfg, now=1010.0) == "agent"
+
+
+def test_cost_budget_exhausted(tmp_path):
+    cfg = make_config(tmp_path)
+    cfg.max_total_cost_usd = 5.0
+    state = dict(BASE_STATE, total_cost_usd=5.0)
+    assert decide(state, cfg, now=1010.0) == "budget_exhausted"
+
+
+def test_cost_budget_under_threshold_allows_agent(tmp_path):
+    cfg = make_config(tmp_path)
+    cfg.max_total_cost_usd = 5.0
+    state = dict(BASE_STATE, total_cost_usd=4.99)
+    assert decide(state, cfg, now=1010.0) == "agent"
+
+
+def test_cost_budget_checked_before_retries_exhausted(tmp_path):
+    """Same precedence rule as the call-count budget: a global budget check
+    (dollar or call-count) always wins over a phase-local cap."""
+    cfg = make_config(tmp_path)
+    cfg.max_total_cost_usd = 1.0
+    cfg.max_retries_per_layer = 2
+    state = dict(BASE_STATE, total_cost_usd=1.0, retry_count=2)
+    assert decide(state, cfg, now=1010.0) == "budget_exhausted"

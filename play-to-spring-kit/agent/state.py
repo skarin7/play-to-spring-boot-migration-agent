@@ -77,6 +77,11 @@ class MigrationState(TypedDict, total=False):
     # counters
     retry_count: int  # LLM fix rounds for the current slice
     total_llm_calls: int  # global run budget (legacy: status["autonomous"]["total_llm_calls"])
+    # M6 Task 5: running USD total across the whole run, summed from each
+    # agent call's pricing.cost_usd() result (0.0 for a call whose model has
+    # no rate-table entry -- see pricing.py). Alongside total_llm_calls, not
+    # instead of it: call count is still the pre-existing default guard.
+    total_cost_usd: float
 
     # loop memory (legacy parity: last 5 rounds of sorted file:line:msg)
     error_fingerprints: list[list[str]]
@@ -112,9 +117,23 @@ class MigrationState(TypedDict, total=False):
     run_outcome: str
     run_exit_code: int
 
+    # Per-file/per-batch crash recovery journal (M6 Task 7): lines already
+    # folded per journal file name, so re-folding on a re-dispatched unit
+    # doesn't recount lines already accounted for. See tools/journal.py.
+    journal_offsets: dict[str, int]
+
     # bootstrap (M3)
     bootstrap_attempts: int
     bootstrap_decision: str  # "skip" | "agent" | "retry" | "exhausted"
+
+    # architect phase (M6 Task 6): runs once after inventory, before the
+    # first transform. Writes .migration/decisions.md -- every later agent
+    # prompt is told the path, never the contents (push paths, not bytes).
+    # Interactive mode gates approval via interrupt(); headless auto-approves
+    # and logs that it did (same headless-never-blocks invariant as every
+    # other interactive gate in this codebase).
+    architect_attempts: int
+    architect_decision: str  # "skip" | "agent" | "retry" | "exhausted" | "approved" | "revise"
 
     # generic compile-fix re-entry (M4+): any phase that needs another pass
     # through the shared compile-fix subgraph sets phase="fix_cycle" and
@@ -143,6 +162,37 @@ class MigrationState(TypedDict, total=False):
     # always resolves to "abort"; interactive mode resolves to "retry" or
     # "abort" based on the human's interrupt() answer.
     human_gate_decision: str  # "retry" | "abort"
+
+    # T2 signature-preservation tier (M6): accumulates across the whole run,
+    # one entry per slice/whole-tree check (see tools/signature_diff.py).
+    # Never gates the run by itself (soft finding, like routes/config_mapping) --
+    # it records what a hollowed-out method looks like, it doesn't halt on one.
+    signature_findings: list[dict[str, Any]]
+
+    # Play-repo integrity guard (M6 Task 2): set by compile_node when
+    # tools/play_guard.py reports anything other than "clean". Read by
+    # route_after_compile to short-circuit straight to play_repo_tampered,
+    # bypassing route_by_phase since this must abort regardless of phase.
+    # MUST be declared here -- LangGraph's StateGraph(MigrationState) uses
+    # this TypedDict as its schema and silently drops any node-returned key
+    # that isn't declared, which is exactly the bug this comment is warning
+    # the next person away from re-discovering the hard way.
+    play_repo_guard_status: str  # "" (default/unset) | "tampered" | "error"
+
+    # Findings severity model (M6 Task 10/11): tier/severity-tagged findings
+    # from T4 (mvn test) and T5 (endpoint parity) -- matches the plugin's
+    # qa_findings shape (tier, severity: blocker|major|minor, category,
+    # scope, status). Distinct from signature_findings (T2, above) only
+    # because T2 predates this general shape; a future pass could fold both
+    # into one list, not done here to avoid touching Task 1's already-tested
+    # accumulation logic.
+    findings: list[dict[str, Any]]
+    test_result: dict[str, Any] | None
+
+    # T5 endpoint parity (M6 Task 10): status "not_attempted" | "error" |
+    # "passed" | "differences_found". Never gates the run -- see
+    # nodes/endpoint_parity.py.
+    endpoint_verification: dict[str, Any] | None
 
 
 # Exit-code parity with the legacy orchestrator (see migration_orchestrator.py:main)
@@ -175,4 +225,10 @@ RUN_OUTCOME_EXIT_CODES: dict[str, int] = {
     "setup_failed": 1,  # generic setup failure (jar build / setup.sh) — legacy parity: `return 1`
     "init_failed": EXIT_INIT_NOT_DONE,
     "runtime_wiring_failed": EXIT_SLICE_FAILURE,  # app never booted; same "manual intervention" bucket
+    # M6 Task 2: the Play repo (read-only invariant) was modified during the
+    # run, or the integrity guard itself could not run ("error" is treated
+    # the same as "tampered" -- a guard that cannot run is not a guard that
+    # passed). One of only two conditions that halt the whole run outright
+    # rather than degrading to a soft/per-slice finding.
+    "play_repo_tampered": EXIT_INFRASTRUCTURE,
 }

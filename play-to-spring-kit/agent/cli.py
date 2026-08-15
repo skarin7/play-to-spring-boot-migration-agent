@@ -18,6 +18,7 @@ from langgraph.types import Command
 from .checkpoint import make_checkpointer, thread_id_for
 from .config import AgentConfig
 from .graph import build_graph, recursion_limit
+from .report import console_summary, report_only, write_report
 from .state import MigrationState
 from .status_v2 import status_v2_to_state, write_status_v2
 
@@ -63,6 +64,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--interactive",
         action="store_true",
         help="pause on infrastructure errors for a human decision instead of failing immediately",
+    )
+    p.add_argument(
+        "--report-only",
+        action="store_true",
+        help="regenerate .migration/report.html from an existing migration-status.json "
+        "and exit -- does not run the graph or touch migration state",
     )
 
     # Setup phase (M3): toolkit build + kit setup.sh + optional conf export.
@@ -110,6 +117,18 @@ def main(argv: list[str] | None = None) -> int:
     if not config.spring_repo.is_dir():
         print(f"error: spring repo not found: {config.spring_repo}", file=sys.stderr)
         return 1
+
+    if args.report_only:
+        # Does not run the graph or touch migration state -- reads
+        # migration-status.json straight off disk (see report.py:report_only).
+        try:
+            path = report_only(config)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"wrote {path}", file=sys.stderr)
+        return 0
+
     if not config.api_key:
         print(
             "warning: OPENROUTER_API_KEY not set — LLM fix rounds disabled "
@@ -134,6 +153,21 @@ def main(argv: list[str] | None = None) -> int:
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit(config),
     }
+    if config.tracing_enabled:
+        # Threaded through as run-level tags/metadata (M6 Task 12) rather
+        # than left to LangSmith's own per-call defaults, so every LLM call
+        # inside this graph.invoke -- and a resumed run's later invoke
+        # calls, since thread_id is stable across resumes -- groups under
+        # one identity in the LangSmith UI. LANGCHAIN_TRACING_V2/
+        # LANGCHAIN_API_KEY (read by LangChain itself, not this code) are
+        # what actually turn export on; config.tracing_enabled only gates
+        # whether THIS engine adds these extra tags on top.
+        run_config["tags"] = [f"thread:{thread_id}", f"spring_repo:{config.spring_repo.name}"]
+        run_config["metadata"] = {
+            "project_name": config.trace_project,
+            "thread_id": thread_id,
+            "spring_repo": str(config.spring_repo),
+        }
 
     # One get_state call serves two purposes below: (1) adoption eligibility
     # -- an empty .values means no langgraph checkpoint has ever been
@@ -213,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     write_status_v2(final, config)
+    write_report(final, config)
 
     outcome = final.get("run_outcome", "failed")
     exit_code = int(final.get("run_exit_code", 1))
@@ -222,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
         f"run_outcome={outcome} slices_done={done}/{len(units)} "
         f"llm_calls={final.get('total_llm_calls', 0)} exit={exit_code}"
     )
+    # M6 Task 11: blocker-severity findings only + cost + a pointer to the
+    # full report -- everything else (clean layers, major/minor findings)
+    # lives in report.html, not the console.
+    print(console_summary(final, config))
     return exit_code
 
 

@@ -18,6 +18,7 @@ from typing import Any
 from ..config import AgentConfig, TaskSignals
 from ..llm import ToolLoopResult, append_usage_log, make_model, run_tool_loop
 from ..tools.fs import FsJail
+from .architect import DECISIONS_READ_FIRST_LINE
 
 LOG = logging.getLogger("agent.routes")
 
@@ -40,7 +41,7 @@ parameter if it is missing. Make sure the containing class is annotated \
 @RestController. Use the read_file/list_dir tools to find the controller, \
 then str_replace or write_file to add the annotation. Do not change method \
 bodies or business logic.
-"""
+""" + DECISIONS_READ_FIRST_LINE
 
 
 def _format_unmapped(unmapped: list[dict[str, Any]]) -> str:
@@ -66,14 +67,14 @@ def run_routes_agent(
     model_name = config.choose_model(TaskSignals(retry_count=attempt - 1, item_count=len(unmapped)))
     model = model_override if model_override is not None else make_model(config, model_name)
 
-    jail = FsJail(config.spring_repo, config.play_repo)
+    jail = FsJail(config.spring_repo, config.play_repo, dry_run=config.dry_run)
     started = time.time()
     result = run_tool_loop(
         model=model,
-        tools=jail.build_tools(),
+        tools=jail.build_tools(phase="routes"),
         system=SYSTEM_PROMPT,
         user=_user_prompt(unmapped),
-        max_tool_calls=config.max_agent_tool_calls,
+        max_tool_calls=config.max_agent_tool_calls_for("routes"),
         config=config,
         model_name=model_name,
         phase="routes",
@@ -90,6 +91,7 @@ def run_routes_agent(
             "tool_calls": result.tool_calls,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
             "compactions": result.compactions,
             "edited_files": [str(p) for p in jail.edited_files],
         },

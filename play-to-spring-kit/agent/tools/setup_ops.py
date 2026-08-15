@@ -37,11 +37,19 @@ RunCmd = Callable[[list[str], Path | None, bool], subprocess.CompletedProcess]
 FetchJar = Callable[[Path, Path], Path]
 
 
+# setup.sh can build the dev-toolkit JAR from source (mvn package), so this
+# needs headroom beyond a single JAR invocation's budget (M6 Task 2).
+DEFAULT_SUBPROCESS_TIMEOUT_SEC = 1800
+
+
 def run_cmd(argv: list[str], cwd: Path | None, dry_run: bool) -> subprocess.CompletedProcess:
     if dry_run:
         print("[dry-run]", " ".join(shlex.quote(a) for a in argv), file=sys.stderr)
         return subprocess.CompletedProcess(argv, 0, "", "")
-    return subprocess.run(argv, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
+    return subprocess.run(
+        argv, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
+        timeout=DEFAULT_SUBPROCESS_TIMEOUT_SEC,
+    )
 
 
 def scripts_dir() -> Path:
@@ -127,6 +135,16 @@ def ensure_jar_in_kit_lib(
         except SystemExit as e:
             return False, str(e)
         return True, f"Fetched {jar.name} -> {jar}"
+
+    # M6 Task 2: this path bypasses fetch_jar.py's checksum verification
+    # entirely -- a deliberate developer escape hatch (local toolkit
+    # iteration), not a default. Logged loudly so it's visible in every run
+    # that takes it, not buried in the (ok, msg) tuple only the caller sees.
+    LOG.warning(
+        "build_toolkit_from_source=True: building dev-toolkit from %s with no checksum "
+        "verification (fetch_jar.py's pinned-release check is skipped entirely on this path)",
+        toolkit_root,
+    )
 
     if not toolkit_root.is_dir():
         return False, (

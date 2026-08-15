@@ -55,6 +55,8 @@ def _make_bootstrapped(spring_repo) -> None:
     props_dir = spring_repo / "src" / "main" / "resources"
     props_dir.mkdir(parents=True)
     (props_dir / "application.properties").write_text("")
+    (spring_repo / ".migration").mkdir(parents=True, exist_ok=True)
+    (spring_repo / ".migration" / "decisions.md").write_text("# Migration Decisions\n")
 
 
 def _write_controller(spring_repo, content: str) -> None:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 from .config import AgentConfig
-from .legacy_logic import is_looping
+from .legacy_logic import is_looping, stuck_vs_progress_reason
 from .state import GuardDecision, MigrationState
+
+LOG = logging.getLogger("agent.guards")
 
 
 def timed_out(state: MigrationState, config: AgentConfig, now: float | None = None) -> bool:
@@ -27,6 +30,11 @@ def decide(state: MigrationState, config: AgentConfig, now: float | None = None)
     """
     if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
         return "budget_exhausted"
+    # M6 Task 5: dollar cap alongside the call-count cap, same precedence
+    # (checked here, before every other guard). 0 means off -- unset by
+    # default so this never fires unless explicitly configured.
+    if config.max_total_cost_usd > 0 and state.get("total_cost_usd", 0.0) >= config.max_total_cost_usd:
+        return "budget_exhausted"
 
     # The agent itself already told us (via flag_for_manual_review, tools/fs.py)
     # that this needs a redesign, not more incremental attempts -- no point
@@ -41,8 +49,18 @@ def decide(state: MigrationState, config: AgentConfig, now: float | None = None)
         return "timeout"
 
     fingerprints = state.get("error_fingerprints", [])
-    if len(fingerprints) >= 2 and is_looping(fingerprints[-1], fingerprints[:-1]):
-        return "looping"
+    if len(fingerprints) >= 2:
+        # M6 Task 12: surfaces WHICH case fired -- identical/oscillating
+        # (genuinely stuck) vs. error_count_spike/different_error_set (a fix
+        # likely landed and exposed a different problem underneath, the
+        # exact case a pure count-based read can misjudge as still stuck).
+        # Logging only -- does not change is_looping's own decision below.
+        reason = stuck_vs_progress_reason(fingerprints[-1], fingerprints[:-1])
+        if is_looping(fingerprints[-1], fingerprints[:-1]):
+            LOG.info("guard: loop detected (%s)", reason)
+            return "looping"
+        if reason == "different_error_set":
+            LOG.info("guard: error set changed but not classified as looping (%s) -- likely progress", reason)
 
     # cluster_node only runs when compile actually failed (route_after_compile
     # sends a clean compile straight to "done"), so last_compile.errors is

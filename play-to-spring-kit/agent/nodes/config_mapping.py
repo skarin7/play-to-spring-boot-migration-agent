@@ -104,7 +104,9 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             config_map = _write_config_map(config, cumulative_seed_mapped, leftover)
             return {"config_map": config_map, "config_mapping_decision": "proceed"}
 
-        run_config_mapping_agent(config, leftover, attempt=attempts + 1, model_override=ctx.model_override)
+        _edited, result = run_config_mapping_agent(
+            config, leftover, attempt=attempts + 1, model_override=ctx.model_override
+        )
         # Persist config_map on the loop branch too (not just the terminal
         # proceed/budget_exhausted paths) -- otherwise any seed_mapped keys
         # applied this round are silently lost from the audit record once a
@@ -116,6 +118,7 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
             "config_map": config_map,
             "config_mapping_attempts": attempts + 1,
             "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+            "total_cost_usd": state.get("total_cost_usd", 0.0) + (result.total_cost_usd or 0.0),
             "config_mapping_decision": "loop",
         }
 

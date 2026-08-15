@@ -155,6 +155,15 @@ def test_boot_never_succeeds_run_fails_blocking(tmp_path):
     final = run(cfg, ctx)
     assert final["run_outcome"] == "runtime_wiring_failed"
     assert final["run_exit_code"] == 5
+
+    # M6 Task 8: a boot_failure gap must be recorded, not just the terminal
+    # run_outcome -- this is exactly the kind of blind spot the gaps loop
+    # exists to aggregate across installs.
+    from agent.tools.gaps import read_gaps
+
+    gap_entries = read_gaps(cfg.spring_repo)
+    boot_failure_gaps = [g for g in gap_entries if g["kind"] == "boot_failure"]
+    assert len(boot_failure_gaps) == 1
     assert final["runtime_wiring_attempts"] == 2
     assert final["total_llm_calls"] == 2
     assert boot_runner.calls == 3

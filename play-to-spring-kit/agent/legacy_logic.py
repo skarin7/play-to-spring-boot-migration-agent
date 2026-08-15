@@ -198,3 +198,43 @@ def is_looping(current: list[str], history: list[list[str]]) -> bool:
     if cur_n > spike_threshold:
         return True
     return False
+
+
+# M6 Task 12: is_looping only ever returned a bool, so a caller had no way
+# to tell "identical error set, genuinely stuck" apart from "a fix landed
+# and exposed a larger set of DIFFERENT errors underneath" -- the plugin's
+# own observation is that the second case is common and gets misjudged by a
+# pure error-count heuristic if one exists (this one doesn't score by count
+# alone, but the spike branch above still can't distinguish "more of the
+# same problem" from "a different, deeper layer of problems"). This
+# function classifies the SAME comparison is_looping makes, for logging/the
+# report only -- it does not change is_looping's own decision, both callers
+# (guards.py, nodes/fix_loop.py) are unmodified.
+def stuck_vs_progress_reason(current: list[str], history: list[list[str]]) -> str:
+    """One of: "no_history" | "identical_to_last" | "oscillating" |
+    "error_count_spike" | "progressing" | "different_error_set"."""
+    if len(history) < 1:
+        return "no_history"
+    if current == history[-1]:
+        return "identical_to_last"
+    if len(history) >= 2 and current == history[-2]:
+        return "oscillating"
+    prev_n = len(history[-1])
+    cur_n = len(current)
+    # prev_n == 0 and cur_n == 0 is unreachable here: that combination means
+    # current == history[-1] == [], which the identical_to_last check above
+    # already caught. So prev_n == 0 at this point always means cur_n > 0 --
+    # a fresh, different error appeared where none existed before.
+    if prev_n == 0:
+        return "different_error_set"
+    if cur_n < prev_n:
+        return "progressing"
+    spike_threshold = max(int(prev_n * 1.5 + 0.999), prev_n + 5)
+    if cur_n > spike_threshold:
+        return "error_count_spike"
+    # cur_n >= prev_n but under the spike threshold, and the sets differ
+    # (already excluded identical_to_last/oscillating above) -- a fix
+    # likely landed and exposed a different (not necessarily larger) set
+    # of errors underneath, the exact case a pure count-based read would
+    # misjudge as "still stuck".
+    return "different_error_set"

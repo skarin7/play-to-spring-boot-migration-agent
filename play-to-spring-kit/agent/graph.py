@@ -8,8 +8,13 @@ mechanism any future phase can reuse — see the note below the diagram):
                         |  (no slices)     |  (all done)             |
                         +-> run_halt(6)    +-> routes_node            |
                                                                       |
-                                          slice_router <---- slice_finalize (continue)
+                        slice_router <-- signature_check <-- slice_finalize (continue)
                                           run_halt <-------- slice_finalize (abort: budget/infra/no_llm)
+
+    signature_check (M6): deterministic T2 tier, no LLM -- see nodes/signature_check.py.
+    Slice-scoped after slice_finalize; unscoped again as signature_check_final
+    between verify and boot_run. Findings accumulate in state.signature_findings
+    and never gate the run by themselves (soft, like routes/config_mapping).
 
     routes_node -+-> routes_node        (self-loop: more unmapped routes, budget left)
                  +-> routes_fix_prep -> compile   (re-enter compile-fix subgraph, phase=fix_cycle)
@@ -102,13 +107,20 @@ from typing import Any, Callable
 from langgraph.graph import END, START, StateGraph
 
 from .config import AgentConfig
+from .nodes import architect as architect_nodes
 from .nodes import bootstrap as bootstrap_nodes
 from .nodes import boot as boot_nodes
+from .nodes import endpoint_parity as endpoint_parity_nodes
 from .nodes import config_mapping as config_mapping_nodes
 from .nodes import fix_loop
 from .nodes import human_gate as human_gate_nodes
 from .nodes import routes as routes_nodes
 from .nodes import slice_pipeline as slice_pipeline_nodes
+from .nodes.architect import (
+    route_after_architect_check,
+    route_after_architect_gate,
+    route_after_architect_verify,
+)
 from .nodes.boot import route_after_boot_run, route_after_runtime_wiring_node
 from .nodes.bootstrap import route_after_bootstrap_check, route_after_bootstrap_verify, route_after_setup
 from .nodes.common import after_fix_cycle_node, route_after_fix_cycle, route_by_phase
@@ -117,12 +129,14 @@ from .nodes.fix_loop import (
     done_node,
     halt_node,
     infra_node,
+    play_repo_tampered_node,
     route_after_compile,
     route_after_det_fix,
     route_after_guard,
 )
 from .nodes.human_gate import route_after_human_gate
 from .nodes.routes import route_after_routes_node, routes_fix_prep_node
+from .nodes.signature_check import build as build_signature_check_nodes
 from .nodes.slice_pipeline import (
     route_after_inventory,
     route_after_slice_finalize,
@@ -133,11 +147,21 @@ from .nodes.slice_pipeline import (
     slice_router_node,
 )
 from .state import MigrationState
-from .tools.maven import BootResult
+from .tools.maven import BootResult, TestResult
 
 JarRunner = Callable[[AgentConfig, str], "tuple[int, int]"]
 BootRunner = Callable[[AgentConfig], BootResult]
 InventoryRunner = Callable[[AgentConfig], "dict[str, Any] | None"]
+SignatureRunner = Callable[
+    [AgentConfig, "Any", "Any"], "tuple[dict[str, Any] | None, dict[str, Any] | None]"
+]
+TestRunner = Callable[[AgentConfig], TestResult]
+# Returns None if the runner couldn't boot both apps (logged, not an error).
+# Otherwise (diff_entries, unproved, probes_compared) -- see
+# nodes/endpoint_parity.py and tools/endpoint_diff.py.
+EndpointParityRunner = Callable[
+    [AgentConfig, "list[dict[str, Any]]"], "tuple[list[dict[str, Any]], list[dict[str, Any]], int] | None"
+]
 
 
 @dataclass
@@ -151,15 +175,44 @@ class RuntimeCtx:
     jar_runner: JarRunner | None = None
     setup_ops: Any = None
     bootstrap_model_override: Any = None
+    architect_model_override: Any = None
     boot_runner: BootRunner | None = None
     inventory_runner: InventoryRunner | None = None
+    signature_runner: SignatureRunner | None = None
+    test_runner: TestRunner | None = None
+    # No default implementation wired in default_ctx() (unlike every other
+    # runner above) -- dual-boot Play+Spring orchestration is repo-dependent
+    # in a way this codebase has no existing wrapper for. None here means T5
+    # degrades to "not_attempted", never a run-blocking condition. See
+    # nodes/endpoint_parity.py's module docstring.
+    endpoint_parity_runner: EndpointParityRunner | None = None
 
 
 def _default_jar_runner(config: AgentConfig, path_prefix: str) -> tuple[int, int]:
+    from .tools.journal import write_entry
     from .tools.toolkit_jar import migrate_until_done
 
     if config.play_repo is None or config.jar_path is None or not config.jar_path.is_file():
         return 0, 0
+
+    # M6 Task 7: journal key derived from path_prefix, not the JarRunner
+    # call's caller-side unit id -- the public JarRunner signature
+    # (Callable[[AgentConfig, str], tuple[int, int]]) is exercised directly
+    # by several existing test fixtures with 2-arg lambdas, so it stays
+    # unchanged; this keeps the per-batch write entirely inside the default
+    # implementation. path_prefix is already the per-unit distinguishing
+    # value transform_node passes in, so it's a stable-enough journal key.
+    unit_key = path_prefix or "app_root"
+
+    def on_batch(n: int, m: int, remaining: int) -> None:
+        write_entry(
+            config.spring_repo,
+            unit_key,
+            {"unit": unit_key, "action": "migrated", "count": n, "remaining": remaining},
+        )
+        if m:
+            write_entry(config.spring_repo, unit_key, {"unit": unit_key, "action": "compiled", "error_count": m})
+
     return migrate_until_done(
         config.play_repo,
         config.jar_path,
@@ -167,6 +220,7 @@ def _default_jar_runner(config: AgentConfig, path_prefix: str) -> tuple[int, int
         config.migrate_batch_size,
         config.dry_run,
         path_prefix=path_prefix,
+        on_batch=on_batch,
     )
 
 
@@ -184,12 +238,30 @@ def _default_inventory_runner(config: AgentConfig) -> "dict[str, Any] | None":
     return run_inventory_scan(config.play_repo, config.jar_path, report_path, config.dry_run)
 
 
+def _default_signature_runner(
+    config: AgentConfig, play_root: Any, spring_root: Any
+) -> "tuple[dict[str, Any] | None, dict[str, Any] | None]":
+    """Runs `signature` twice (Play root, Spring root) via two temp report
+    files under .migration/ -- separate files, not one shared path, so a
+    slice-scoped call racing a later final call never clobbers the other's
+    still-being-read report."""
+    from .tools.signature_diff import run_signature_scan
+
+    if config.jar_path is None:
+        return None, None
+    play_report_path = config.migration_dir / "signature-play.json"
+    spring_report_path = config.migration_dir / "signature-spring.json"
+    play_report = run_signature_scan(play_root, config.jar_path, play_report_path, config.dry_run)
+    spring_report = run_signature_scan(spring_root, config.jar_path, spring_report_path, config.dry_run)
+    return play_report, spring_report
+
+
 def default_ctx(config: AgentConfig) -> RuntimeCtx:
     from compile_error_fixer import CompileErrorFixer
     from error_clusterer import ErrorClusterer
     from incremental_compiler import IncrementalCompiler
 
-    from .tools.maven import run_spring_boot
+    from .tools.maven import run_mvn_test, run_spring_boot
     from .tools.setup_ops import SetupOps
 
     return RuntimeCtx(
@@ -200,6 +272,8 @@ def default_ctx(config: AgentConfig) -> RuntimeCtx:
         setup_ops=SetupOps(),
         boot_runner=lambda cfg: run_spring_boot(cfg.spring_repo, cfg.boot_timeout_sec, cfg.dry_run),
         inventory_runner=_default_inventory_runner,
+        signature_runner=_default_signature_runner,
+        test_runner=lambda cfg: run_mvn_test(cfg.spring_repo, cfg.test_timeout_sec, cfg.dry_run),
     )
 
 
@@ -207,12 +281,15 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     ctx = ctx or default_ctx(config)
 
     b = bootstrap_nodes.build(config, ctx)
+    arch = architect_nodes.build(config, ctx)
     sp = slice_pipeline_nodes.build(config, ctx)
     fl = fix_loop.build(config, ctx)
     rt = routes_nodes.build(config, ctx)
     cm = config_mapping_nodes.build(config, ctx)
     bt = boot_nodes.build(config, ctx)
     hg = human_gate_nodes.build(config, ctx)
+    sc = build_signature_check_nodes(config, ctx)
+    ep = endpoint_parity_nodes.build(config, ctx)
 
     # ------------------------------------------------------------------
     # Wiring
@@ -225,9 +302,15 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("bootstrap_verify", b["bootstrap_verify_node"])
 
     g.add_node("inventory", sp["inventory_node"])
+    g.add_node("architect_check", arch["architect_check_node"])
+    g.add_node("architect_agent", arch["architect_agent_node"])
+    g.add_node("architect_verify", arch["architect_verify_node"])
+    g.add_node("architect_gate", arch["architect_gate_node"])
     g.add_node("slice_router", slice_router_node)
     g.add_node("transform", sp["transform_node"])
     g.add_node("slice_finalize", sp["slice_finalize_node"])
+    g.add_node("signature_check", sc["signature_check_node"])
+    g.add_node("signature_check_final", sc["signature_check_final_node"])
     g.add_node("routes", rt["routes_node"])
     g.add_node("routes_fix_prep", routes_fix_prep_node)
     g.add_node("after_fix_cycle", after_fix_cycle_node)
@@ -235,6 +318,8 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
     g.add_node("verify", sp["verify_node"])
     g.add_node("boot_run", bt["boot_run_node"])
     g.add_node("runtime_wiring", bt["runtime_wiring_node"])
+    g.add_node("endpoint_parity", ep["endpoint_parity_node"])
+    g.add_node("play_repo_tampered", play_repo_tampered_node)
     g.add_node("run_done", run_done_node)
     g.add_node("run_halt", run_halt_node)
 
@@ -260,14 +345,38 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         {"inventory": "inventory", "bootstrap_agent": "bootstrap_agent", "run_halt": "run_halt"},
     )
 
-    g.add_conditional_edges("inventory", route_after_inventory, {"router": "slice_router", "no_slices": "run_halt"})
+    g.add_conditional_edges(
+        "inventory", route_after_inventory, {"router": "architect_check", "no_slices": "run_halt"}
+    )
+    g.add_conditional_edges(
+        "architect_check",
+        route_after_architect_check,
+        {"skip": "slice_router", "architect_agent": "architect_agent"},
+    )
+    g.add_edge("architect_agent", "architect_verify")
+    g.add_conditional_edges(
+        "architect_verify",
+        route_after_architect_verify,
+        {"gate": "architect_gate", "architect_agent": "architect_agent", "run_halt": "run_halt"},
+    )
+    g.add_conditional_edges(
+        "architect_gate",
+        route_after_architect_gate,
+        {"inventory_done": "slice_router", "run_halt": "run_halt"},
+    )
     g.add_conditional_edges("slice_router", route_after_slice_router, {"transform": "transform", "routes": "routes"})
     g.add_edge("transform", "compile")
 
     g.add_conditional_edges(
         "compile",
         route_after_compile,
-        {"done": "done", "infra": "human_gate", "det_fix": "det_fix", "halt": "halt"},
+        {
+            "done": "done",
+            "infra": "human_gate",
+            "det_fix": "det_fix",
+            "halt": "halt",
+            "play_repo_tampered": "play_repo_tampered",
+        },
     )
     g.add_conditional_edges(
         "human_gate", route_after_human_gate, {"compile": "compile", "infra": "infra"}
@@ -288,8 +397,9 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         "halt", route_by_phase, {"slice_finalize": "slice_finalize", "after_fix_cycle": "after_fix_cycle"}
     )
     g.add_conditional_edges(
-        "slice_finalize", route_after_slice_finalize, {"router": "slice_router", "halt": "run_halt"}
+        "slice_finalize", route_after_slice_finalize, {"router": "signature_check", "halt": "run_halt"}
     )
+    g.add_edge("signature_check", "slice_router")
 
     g.add_conditional_edges(
         "routes",
@@ -314,17 +424,20 @@ def build_graph(config: AgentConfig, ctx: RuntimeCtx | None = None):
         {"config_mapping": "config_mapping", "verify": "verify", "halt": "run_halt"},
     )
 
-    g.add_conditional_edges("verify", route_after_verify, {"halt": "run_halt", "boot_run": "boot_run"})
+    g.add_conditional_edges("verify", route_after_verify, {"halt": "run_halt", "boot_run": "signature_check_final"})
+    g.add_edge("signature_check_final", "boot_run")
     g.add_conditional_edges(
         "boot_run",
         route_after_boot_run,
-        {"final_verification": "run_done", "runtime_wiring": "runtime_wiring"},
+        {"final_verification": "endpoint_parity", "runtime_wiring": "runtime_wiring"},
     )
+    g.add_edge("endpoint_parity", "run_done")
     g.add_conditional_edges(
         "runtime_wiring", route_after_runtime_wiring_node, {"halt": "run_halt", "boot_run": "boot_run"}
     )
     g.add_edge("run_done", END)
     g.add_edge("run_halt", END)
+    g.add_edge("play_repo_tampered", END)
     return g
 
 

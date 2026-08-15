@@ -32,6 +32,10 @@ def phase_budget_decision(
     """
     if state.get("total_llm_calls", 0) >= config.max_total_llm_calls:
         return "budget_exhausted"
+    # M6 Task 5: same dollar-cap precedence as guards.decide -- before the
+    # phase-local attempts cap, off by default (max_total_cost_usd == 0).
+    if config.max_total_cost_usd > 0 and state.get("total_cost_usd", 0.0) >= config.max_total_cost_usd:
+        return "budget_exhausted"
     if attempts >= max_attempts:
         return "attempts_exhausted"
     return "continue"

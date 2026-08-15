@@ -40,6 +40,23 @@ def route_after_bootstrap_verify(state: MigrationState) -> str:
 
 def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
     def setup_node(state: MigrationState) -> dict:
+        # Play-repo integrity baseline (M6 Task 2): captured before anything
+        # else in setup touches the Play repo -- ensure_jar/install/export_conf
+        # below all run with cwd=play_repo, unjailed. Idempotent: safe to
+        # re-capture on resume, see tools/play_guard.py:capture_baseline.
+        if config.play_guard_enabled and config.play_repo is not None and config.play_repo.is_dir():
+            from ..tools.play_guard import capture_baseline
+
+            baseline_path = config.migration_dir / "play-baseline.json"
+            try:
+                capture_baseline(config.play_repo, baseline_path)
+            except OSError as exc:
+                LOG.error("play-repo guard: could not capture baseline: %s", exc)
+                return {
+                    "run_outcome": "play_repo_tampered",
+                    "run_exit_code": RUN_OUTCOME_EXIT_CODES["play_repo_tampered"],
+                }
+
         if ctx.setup_ops is None:
             return {}
         for phase, op in (("jar", ctx.setup_ops.ensure_jar), ("setup.sh", ctx.setup_ops.install)):

@@ -51,6 +51,9 @@ class AgentConfig:
     # Bootstrap agent (M3)
     max_bootstrap_attempts: int = 2
 
+    # Architect agent (M6 Task 6)
+    max_architect_attempts: int = 2
+
     # Routes agent (M4)
     max_routes_attempts: int = 2
 
@@ -64,6 +67,21 @@ class AgentConfig:
     # last 4 attempts once escalate_after_retries=2 is exceeded).
     max_runtime_wiring_attempts: int = 6
     boot_timeout_sec: int = 90
+
+    # T4 tests (M6 Task 10): `mvn test` in verify_node, gated on this flag --
+    # default on. A test failure is a finding, never a halt (same soft-finding
+    # model as T2 signatures and routes/config_mapping).
+    run_tests: bool = field(default_factory=lambda: os.environ.get("MIGRATION_RUN_TESTS", "1").strip() != "0")
+    test_timeout_sec: int = field(default_factory=lambda: _env_int("MIGRATION_TEST_TIMEOUT_SEC", 600))
+
+    # Play-repo integrity guard (M6). Detection layer for the read-only-Play
+    # invariant that FsJail only enforces for LLM writes -- setup.sh and the
+    # dev-toolkit JAR both run with cwd=play_repo, unjailed. On by default
+    # whenever play_repo is configured; the escape hatch exists for
+    # standalone/no-play_repo test setups where there is nothing to guard.
+    play_guard_enabled: bool = field(
+        default_factory=lambda: os.environ.get("MIGRATION_PLAY_GUARD_ENABLED", "1").strip() != "0"
+    )
 
     # LLM backend (OpenRouter / any OpenAI-compatible endpoint)
     base_url: str = field(
@@ -82,6 +100,14 @@ class AgentConfig:
 
     # Guardrails (parity with legacy Guardrails dataclass)
     max_total_llm_calls: int = field(default_factory=lambda: _env_int("MAX_TOTAL_LLM_CALLS", 50))
+    # M6 Task 5: a dollar cap alongside the call-count cap. 0 (default) means
+    # off -- call count alone is the pre-existing behavior, unchanged unless
+    # this is explicitly set. Checked with the SAME precedence as
+    # max_total_llm_calls: before any phase-local attempts cap, aborting the
+    # whole run (see guards.decide and nodes/common.phase_budget_decision).
+    max_total_cost_usd: float = field(
+        default_factory=lambda: float(os.environ.get("MAX_TOTAL_COST_USD", "0") or "0")
+    )
     max_retries_per_layer: int = field(
         default_factory=lambda: _env_int("MAX_RETRIES_PER_LAYER", 5)
     )
@@ -96,6 +122,42 @@ class AgentConfig:
     max_agent_context_tokens: int = field(
         default_factory=lambda: _env_int("MAX_AGENT_CONTEXT_TOKENS", 50_000)
     )
+
+    # Prompt caching (M6 Task 4): marks the system prompt + the stable prefix
+    # of the user message as an Anthropic cache_control breakpoint, routed
+    # through OpenRouter. Default on; an escape hatch for a routed model that
+    # rejects cache_control blocks rather than ignoring them gracefully --
+    # OpenRouter model support varies (see docs/superpowers/plans/
+    # 2026-08-15-plugin-parity-hardening.md, Task 4 open question).
+    prompt_caching_enabled: bool = field(
+        default_factory=lambda: os.environ.get("MIGRATION_PROMPT_CACHING", "1").strip() != "0"
+    )
+
+    # Tracing (M6 Task 12): LangSmith export for every LangChain/LangGraph
+    # call is itself entirely env-var driven (LANGCHAIN_TRACING_V2,
+    # LANGCHAIN_API_KEY) -- no code wiring needed to turn it on, which is
+    # the "near-free" the plan refers to. What this engine adds on top: a
+    # per-run trace_id (so every LLM call and the graph.invoke that contains
+    # them group under one identity in the LangSmith UI) and a stable
+    # project name, both threaded through as run-level tags/metadata by
+    # cli.py's run_config rather than left to LangSmith's own defaults.
+    tracing_enabled: bool = field(
+        default_factory=lambda: os.environ.get("LANGCHAIN_TRACING_V2", "").strip().lower() == "true"
+    )
+    trace_project: str = field(
+        default_factory=lambda: os.environ.get("LANGCHAIN_PROJECT", "play-to-spring-migration")
+    )
+
+    def max_agent_tool_calls_for(self, phase: str) -> int:
+        """Per-phase tool-call cap (M6 Task 9), env override
+        MAX_AGENT_TOOL_CALLS_<PHASE> (e.g. MAX_AGENT_TOOL_CALLS_COMPILE_FIX).
+        Defaults to max_agent_tool_calls unchanged, so nothing changes for a
+        phase unless explicitly tuned. Reads the env fresh on each call
+        (like every other _env_int use) rather than caching at __post_init__
+        time, so a test's monkeypatch.setenv takes effect without needing a
+        fresh AgentConfig."""
+        env_name = f"MAX_AGENT_TOOL_CALLS_{phase.upper()}"
+        return _env_int(env_name, self.max_agent_tool_calls)
 
     def __post_init__(self) -> None:
         self.spring_repo = Path(self.spring_repo).resolve()

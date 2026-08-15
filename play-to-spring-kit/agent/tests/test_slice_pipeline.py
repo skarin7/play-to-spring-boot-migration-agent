@@ -89,6 +89,8 @@ def test_inventory_node_logs_paradigm_and_unknown_gaps_before_transform(tmp_path
     (spring_repo / "src" / "main" / "resources").mkdir(parents=True)
     (spring_repo / "src" / "main" / "resources" / "application.properties").write_text("")
     (spring_repo / "pom.xml").write_text("<project></project>")
+    (spring_repo / ".migration").mkdir(parents=True, exist_ok=True)
+    (spring_repo / ".migration" / "decisions.md").write_text("# Migration Decisions\n")
     cfg = AgentConfig(spring_repo=spring_repo, play_repo=play_repo)
     cfg.api_key = "test-key"
     jar = FakeJarRunner()
@@ -125,6 +127,8 @@ def test_inventory_node_calls_inventory_runner_and_stores_report(tmp_path):
     (spring_repo / "src" / "main" / "resources").mkdir(parents=True)
     (spring_repo / "src" / "main" / "resources" / "application.properties").write_text("")
     (spring_repo / "pom.xml").write_text("<project></project>")
+    (spring_repo / ".migration").mkdir(parents=True, exist_ok=True)
+    (spring_repo / ".migration" / "decisions.md").write_text("# Migration Decisions\n")
     cfg = AgentConfig(spring_repo=spring_repo, play_repo=play_repo)
     cfg.api_key = "test-key"
     jar = FakeJarRunner()
@@ -157,3 +161,40 @@ def test_one_slice_fails_other_succeeds_yields_slice_failure_exit_code(tmp_path)
     assert by_id["b"]["status"] == "failed"
     assert by_id["b"]["failure_reason"] == "max_retries"
     assert jar.calls == ["a", "b"]
+
+
+def test_transform_reports_migrate_app_errors_as_tool_error_gap(tmp_path):
+    """M6 Task 8: migrate-app itself reporting errors (m_err > 0) is a
+    tool_error signal -- the toolkit JAR hit something it couldn't
+    transform, which is exactly the class of blind spot the gaps loop
+    exists to aggregate across installs."""
+    from agent.tools.gaps import read_gaps
+
+    cfg = make_config(tmp_path)
+    units = [default_unit_entry("a", "a", 0)]
+
+    class ErroringJarRunner:
+        def __call__(self, config, path_prefix):
+            return (2, 3)  # 2 files migrated, 3 errors reported by the JAR
+
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), jar_runner=ErroringJarRunner())
+    run(cfg, ctx, units)
+
+    gap_entries = read_gaps(cfg.spring_repo)
+    tool_error_gaps = [g for g in gap_entries if g["kind"] == "tool_error"]
+    assert len(tool_error_gaps) == 1
+    assert "3 error" in tool_error_gaps[0]["what_i_did"]
+
+
+def test_transform_no_gap_when_migrate_app_reports_zero_errors(tmp_path):
+    from agent.tools.gaps import read_gaps
+
+    cfg = make_config(tmp_path)
+    units = [default_unit_entry("a", "a", 0)]
+    jar = FakeJarRunner()  # returns (0, 0)
+    compiler = FakeCompiler([FakeCompileResult(0)])
+    ctx = RuntimeCtx(compiler, FakeFixer(), _real_clusterer(), jar_runner=jar)
+    run(cfg, ctx, units)
+
+    assert read_gaps(cfg.spring_repo) == []

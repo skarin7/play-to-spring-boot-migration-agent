@@ -43,10 +43,21 @@ def state_to_status_v2(state: MigrationState, config: AgentConfig) -> dict[str, 
         "autonomous": {
             "total_llm_calls": state.get("total_llm_calls", 0),
             "max_total_llm_calls": config.max_total_llm_calls,
+            "total_cost_usd": round(state.get("total_cost_usd", 0.0), 6),
+            "max_total_cost_usd": config.max_total_cost_usd,
             "prompt_cache_key": None,
         },
         "run_outcome": run_outcome,
         "run_exit_code": state.get("run_exit_code"),
+        # M6 Task 11: carried through so report.py's --report-only path can
+        # regenerate report.html from migration-status.json alone, without
+        # re-running the graph (status_v2_to_state only adopts the narrower
+        # set of fields a RESUMED RUN needs -- see that function's own
+        # docstring -- report_only() reads these straight from the raw dict).
+        "signature_findings": [dict(f) for f in (state.get("signature_findings") or [])],
+        "findings": [dict(f) for f in (state.get("findings") or [])],
+        "test_result": state.get("test_result"),
+        "endpoint_verification": state.get("endpoint_verification"),
     }
 
 
@@ -149,5 +160,9 @@ def status_v2_to_state(raw: dict[str, Any]) -> dict[str, Any]:
     total_llm_calls = (migrated.get("autonomous") or {}).get("total_llm_calls")
     if isinstance(total_llm_calls, int):
         state["total_llm_calls"] = total_llm_calls
+
+    total_cost_usd = (migrated.get("autonomous") or {}).get("total_cost_usd")
+    if isinstance(total_cost_usd, (int, float)):
+        state["total_cost_usd"] = float(total_cost_usd)
 
     return state

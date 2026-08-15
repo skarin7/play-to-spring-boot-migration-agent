@@ -51,6 +51,8 @@ def _make_bootstrapped(spring_repo) -> None:
     props_dir = spring_repo / "src" / "main" / "resources"
     props_dir.mkdir(parents=True)
     (props_dir / "application.properties").write_text("")
+    (spring_repo / ".migration").mkdir(parents=True, exist_ok=True)
+    (spring_repo / ".migration" / "decisions.md").write_text("# Migration Decisions\n")
 
 
 def test_skips_bootstrap_when_files_already_present(tmp_path):
@@ -89,9 +91,29 @@ def test_bootstrap_agent_succeeds_on_first_attempt(tmp_path):
             AIMessage(content="done"),
         ]
     )
+    architect_model = FakeToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"path": ".migration/decisions.md", "content": "# Migration Decisions\n"},
+                        "id": "1",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
     compiler = FakeCompiler([FakeCompileResult(0)])
     ctx = RuntimeCtx(
-        compiler, FakeFixer(), _real_clusterer(), setup_ops=FakeSetupOps(), bootstrap_model_override=model
+        compiler,
+        FakeFixer(),
+        _real_clusterer(),
+        setup_ops=FakeSetupOps(),
+        bootstrap_model_override=model,
+        architect_model_override=architect_model,
     )
     final = run(cfg, ctx)
     assert final["bootstrap_attempts"] == 1

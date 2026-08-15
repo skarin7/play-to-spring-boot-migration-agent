@@ -36,6 +36,80 @@ class BootResult:
     log_tail: str
 
 
+@dataclass
+class TestResult:
+    returncode: int
+    log_tail: str
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    skipped: int = 0
+
+    @property
+    def all_passed(self) -> bool:
+        return self.returncode == 0 and self.failed == 0 and self.errors == 0
+
+
+# Maven surefire's own summary line, e.g.:
+# "Tests run: 12, Failures: 1, Errors: 0, Skipped: 2"
+_SUREFIRE_SUMMARY_RE = re.compile(
+    r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)"
+)
+
+
+def _parse_test_summary(log: str) -> tuple[int, int, int, int]:
+    """Sums every "Tests run: N, Failures: N, Errors: N, Skipped: N" line in
+    the log (surefire prints one per test class plus a final aggregate) --
+    the LAST match is the aggregate Maven itself prints, so use that one
+    rather than summing (which would double-count against the per-class
+    lines)."""
+    matches = _SUREFIRE_SUMMARY_RE.findall(log)
+    if not matches:
+        return 0, 0, 0, 0
+    run, failures, errors, skipped = (int(x) for x in matches[-1])
+    passed = run - failures - errors - skipped
+    return passed, failures, errors, skipped
+
+
+def run_mvn_test(
+    spring_repo: Path,
+    timeout_sec: int,
+    dry_run: bool,
+    *,
+    cmd: list[str] = ("mvn", "-q", "-B", "test"),
+    run_cmd: Callable[[list[str], Path, int], Any] | None = None,
+) -> TestResult:
+    """T4 (M6 Task 10): runs `mvn test`, bounded by timeout_sec, and parses
+    surefire's own summary line rather than trying to interpret returncode
+    alone (a returncode of 1 is ambiguous between "tests failed" and "build
+    itself broke" without the summary line to disambiguate)."""
+    if dry_run:
+        return TestResult(returncode=0, log_tail="[dry-run] mvn test skipped", passed=0)
+
+    def _default_run_cmd(argv: list[str], cwd: Path, timeout: int) -> Any:
+        return subprocess.run(
+            argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, errors="replace"
+        )
+
+    runner = run_cmd or _default_run_cmd
+    try:
+        proc = runner(list(cmd), spring_repo, timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        log = (exc.stdout or "") + (exc.stderr or "")
+        return TestResult(returncode=-1, log_tail=log[-LOG_TAIL_CHARS:])
+
+    log = (proc.stdout or "") + (proc.stderr or "")
+    passed, failed, errors, skipped = _parse_test_summary(log)
+    return TestResult(
+        returncode=proc.returncode,
+        log_tail=log[-LOG_TAIL_CHARS:],
+        passed=passed,
+        failed=failed,
+        errors=errors,
+        skipped=skipped,
+    )
+
+
 def _default_popen_factory(argv: list[str], cwd: Path) -> subprocess.Popen:
     return subprocess.Popen(
         argv,

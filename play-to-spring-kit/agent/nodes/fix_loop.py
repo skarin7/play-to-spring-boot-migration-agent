@@ -26,6 +26,11 @@ FINGERPRINT_HISTORY = 5
 
 
 def route_after_compile(state: MigrationState) -> str:
+    # Checked before every other branch: a Play-repo integrity violation
+    # aborts the whole run regardless of phase (slice vs fix_cycle), unlike
+    # every other compile outcome which stays scoped to route_by_phase.
+    if state.get("play_repo_guard_status"):
+        return "play_repo_tampered"
     if state.get("guard_decision") == "timeout":
         return "halt"
     summary = state.get("last_compile", {})
@@ -43,6 +48,12 @@ def route_after_det_fix(state: MigrationState) -> str:
     stuck = len(fingerprints) >= 2 and legacy_logic.is_looping(
         fingerprints[-1], fingerprints[:-1]
     )
+    if len(fingerprints) >= 2:
+        # M6 Task 12: same diagnostic classification as guards.py, logged
+        # here too since this is the OTHER place is_looping's decision
+        # feeds a route -- does not change the stuck/not-stuck decision above.
+        reason = legacy_logic.stuck_vs_progress_reason(fingerprints[-1], fingerprints[:-1])
+        LOG.info("det_fix loop check: stuck=%s reason=%s", stuck, reason)
     if state.get("det_fixed_last_round", 0) > 0 and not stuck:
         return "compile"
     return "cluster"
@@ -50,6 +61,15 @@ def route_after_det_fix(state: MigrationState) -> str:
 
 def route_after_guard(state: MigrationState) -> str:
     return "agent" if state.get("guard_decision") == "agent" else "halt"
+
+
+def play_repo_tampered_node(state: MigrationState) -> dict:
+    from ..state import RUN_OUTCOME_EXIT_CODES
+
+    return {
+        "run_outcome": "play_repo_tampered",
+        "run_exit_code": RUN_OUTCOME_EXIT_CODES["play_repo_tampered"],
+    }
 
 
 def done_node(state: MigrationState) -> dict:
@@ -84,6 +104,24 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         if guards.timed_out(state, config):
             LOG.warning("slice timed out before compile")
             return {"guard_decision": "timeout"}
+
+        # Play-repo integrity guard (M6 Task 2): a file-stat walk, cheap
+        # relative to `mvn`, run every compile round so tampering is caught
+        # promptly rather than only at run end. "error" halts exactly like
+        # "tampered" -- see tools/play_guard.py module docstring. This is a
+        # run-aborting condition regardless of phase (slice vs fix_cycle) --
+        # route_after_compile sends it straight to "halt" via a dedicated
+        # state key rather than overloading guard_decision, which halt_node
+        # maps to slice-outcome vocabulary ("timeout"/"looping"/etc.) that
+        # would misreport what actually happened.
+        if config.play_guard_enabled and config.play_repo is not None:
+            from ..tools.play_guard import check as play_guard_check
+
+            baseline_path = config.migration_dir / "play-baseline.json"
+            status = play_guard_check(config.play_repo, baseline_path)
+            if status != "clean":
+                LOG.error("play-repo guard: status=%s -- halting the run", status)
+                return {"play_repo_guard_status": status}
 
         changed = [Path(p) for p in state.get("last_edited_files", [])]
         result = ctx.compiler.compile(changed or None)
@@ -185,6 +223,7 @@ def build(config: AgentConfig, ctx: "RuntimeCtx") -> dict[str, Callable]:
         updates: dict = {
             "retry_count": state.get("retry_count", 0) + 1,
             "total_llm_calls": state.get("total_llm_calls", 0) + 1,
+            "total_cost_usd": state.get("total_cost_usd", 0.0) + (result.total_cost_usd or 0.0),
             "last_edited_files": [str(p) for p in edited],
         }
         if result.manual_review_reason is not None:
