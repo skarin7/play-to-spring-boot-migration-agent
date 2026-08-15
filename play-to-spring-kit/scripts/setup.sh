@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Play-to-Spring Migration Kit — one-time setup for any Play Framework repo.
-# Usage: scripts/setup.sh <path-to-play-repo> [--workspace <dir>] [--spring-name <name>]
+# Usage: scripts/setup.sh <path-to-play-repo> [--workspace <dir>] [--spring-name <name>] [--skip-cursor-setup]
 #
 # Example (from kit root): ./scripts/setup.sh /path/to/your-play-repo
 #   -> Creates spring-<basename>/ (sibling), workspace.yaml, <play-repo>/.cursor/{config,docs,settings.json,skills} (Cursor-native layout).
+#
+# --skip-cursor-setup: skip installing .cursor/skills, .cursor/settings.json, and the
+#   cursor-agent-specific "Next steps" block. Used by the langgraph engine (agent/), which
+#   never shells out to cursor-agent — only the legacy engine (migration_orchestrator.py) needs it.
 #
 # Example: ./scripts/setup.sh /path/to/your-play-repo --workspace /tmp/migrate --spring-name my-spring-app
 #   -> Uses /tmp/migrate as workspace; Spring project at /tmp/migrate/my-spring-app
@@ -15,6 +19,7 @@ KIT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLAY_REPO=""
 WORKSPACE_DIR=""
 SPRING_NAME=""
+SKIP_CURSOR_SETUP=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -26,6 +31,10 @@ while [[ $# -gt 0 ]]; do
     --spring-name)
       SPRING_NAME="$2"
       shift 2
+      ;;
+    --skip-cursor-setup)
+      SKIP_CURSOR_SETUP="1"
+      shift
       ;;
     -*)
       echo "Unknown option: $1"
@@ -41,11 +50,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$PLAY_REPO" ]]; then
-  echo "Usage: $0 <path-to-play-repo> [--workspace <dir>] [--spring-name <name>]"
+  echo "Usage: $0 <path-to-play-repo> [--workspace <dir>] [--spring-name <name>] [--skip-cursor-setup]"
   echo ""
   echo "  <path-to-play-repo>   Absolute or relative path to the Play project directory"
   echo "  --workspace <dir>     Where to create spring-* and migration state (default: parent of Play repo)"
   echo "  --spring-name <name>  Spring project directory name (default: spring-<play-repo-basename>)"
+  echo "  --skip-cursor-setup   Skip .cursor/skills, .cursor/settings.json, cursor-agent next-steps"
   exit 1
 fi
 
@@ -224,6 +234,15 @@ if ! scaffold_from_initializr; then
   mkdir -p "$SPRING_REPO/src/test/resources"
 fi
 
+# .migration/ holds checkpoints, usage logs, and (langgraph engine) llm-debug.jsonl --
+# full LLM prompts/tool I/O, i.e. Spring source file contents. Never let that land in
+# the customer's Spring repo history.
+SPRING_GITIGNORE="${SPRING_REPO}/.gitignore"
+if [[ ! -f "$SPRING_GITIGNORE" ]] || ! grep -qxF ".migration/" "$SPRING_GITIGNORE" 2>/dev/null; then
+  { [[ -f "$SPRING_GITIGNORE" ]] && [[ -s "$SPRING_GITIGNORE" ]] && echo ""; echo ".migration/"; } >> "$SPRING_GITIGNORE"
+  echo "Added .migration/ to $SPRING_GITIGNORE"
+fi
+
 # workspace.yaml
 WORKSPACE_YAML="${WORKSPACE_DIR}/workspace.yaml"
 cat > "$WORKSPACE_YAML" << EOF
@@ -246,46 +265,48 @@ if [[ ! -f "$ROUTE_MAP" ]]; then
   echo "Created $ROUTE_MAP"
 fi
 
-# Copy skills into Play (source) repo in Cursor Agent format: .cursor/skills/<skill-name>/SKILL.md
-# So when the customer opens the Play repo in Cursor, the agent discovers these skills.
-CURSOR_SKILLS_ROOT="${PLAY_REPO}/.cursor/skills"
-echo "Installing Cursor Agent skills into $CURSOR_SKILLS_ROOT"
-mkdir -p "$CURSOR_SKILLS_ROOT"
+if [[ -z "$SKIP_CURSOR_SETUP" ]]; then
+  # Copy skills into Play (source) repo in Cursor Agent format: .cursor/skills/<skill-name>/SKILL.md
+  # So when the customer opens the Play repo in Cursor, the agent discovers these skills.
+  CURSOR_SKILLS_ROOT="${PLAY_REPO}/.cursor/skills"
+  echo "Installing Cursor Agent skills into $CURSOR_SKILLS_ROOT"
+  mkdir -p "$CURSOR_SKILLS_ROOT"
 
-skill_descriptions() {
-  case "$1" in
-    transformer-skill) echo "Transform Play Framework Java files to Spring Boot. Use when migrating controllers, services, or any Play class." ;;
-    builder-skill)     echo "Compile Spring project and fix errors until build passes. Use after transforming files." ;;
-    orchestrator-skill) echo "Run the full migration: Transform (CLI) then Validation (compile + fix until clean)." ;;
-    *)                echo "Play-to-Spring migration skill." ;;
-  esac
-}
+  skill_descriptions() {
+    case "$1" in
+      transformer-skill) echo "Transform Play Framework Java files to Spring Boot. Use when migrating controllers, services, or any Play class." ;;
+      builder-skill)     echo "Compile Spring project and fix errors until build passes. Use after transforming files." ;;
+      orchestrator-skill) echo "Run the full migration: Transform (CLI) then Validation (compile + fix until clean)." ;;
+      *)                echo "Play-to-Spring migration skill." ;;
+    esac
+  }
 
-for skill_md in "$KIT_ROOT/skills"/*.md; do
-  [[ -f "$skill_md" ]] || continue
-  base=$(basename "$skill_md" .md)
-  # skill name: transformer-skill -> play-spring-transformer (Cursor: lowercase, hyphens)
-  name="play-spring-${base%-skill}"
-  desc=$(skill_descriptions "$base")
-  skill_dir="${CURSOR_SKILLS_ROOT}/${name}"
-  mkdir -p "$skill_dir"
-  {
-    echo "---"
-    echo "name: $name"
-    echo "description: $desc"
-    echo "---"
-    echo ""
-    cat "$skill_md"
-  } > "$skill_dir/SKILL.md"
-  echo "  $name"
-done
+  for skill_md in "$KIT_ROOT/skills"/*.md; do
+    [[ -f "$skill_md" ]] || continue
+    base=$(basename "$skill_md" .md)
+    # skill name: transformer-skill -> play-spring-transformer (Cursor: lowercase, hyphens)
+    name="play-spring-${base%-skill}"
+    desc=$(skill_descriptions "$base")
+    skill_dir="${CURSOR_SKILLS_ROOT}/${name}"
+    mkdir -p "$skill_dir"
+    {
+      echo "---"
+      echo "name: $name"
+      echo "description: $desc"
+      echo "---"
+      echo ""
+      cat "$skill_md"
+    } > "$skill_dir/SKILL.md"
+    echo "  $name"
+  done
 
-# Copy Cursor workspace settings (e.g. agent.autoRun) alongside .cursor/skills/
-if [[ -f "$KIT_ROOT/settings.json" ]]; then
-  cp "$KIT_ROOT/settings.json" "$KIT_DEST/settings.json"
-  echo "Installed $KIT_DEST/settings.json (from kit)"
-else
-  echo "Note: no $KIT_ROOT/settings.json (optional)"
+  # Copy Cursor workspace settings (e.g. agent.autoRun) alongside .cursor/skills/
+  if [[ -f "$KIT_ROOT/settings.json" ]]; then
+    cp "$KIT_ROOT/settings.json" "$KIT_DEST/settings.json"
+    echo "Installed $KIT_DEST/settings.json (from kit)"
+  else
+    echo "Note: no $KIT_ROOT/settings.json (optional)"
+  fi
 fi
 
 echo ""
@@ -294,20 +315,26 @@ echo ""
 echo "  Workspace:       $WORKSPACE_DIR"
 echo "  Play repo:      $PLAY_REPO"
 echo "  Spring project: $SPRING_REPO"
-echo "  Cursor / kit:     $KIT_DEST (skills/ + settings.json + config/ + docs/)"
+if [[ -z "$SKIP_CURSOR_SETUP" ]]; then
+  echo "  Cursor / kit:     $KIT_DEST (skills/ + settings.json + config/ + docs/)"
+fi
 echo "  Agent state:    $SPRING_REPO/migration-status.json (created by orchestrator)"
 echo ""
-echo "Cursor Agent skills: $PLAY_REPO/.cursor/skills/"
-echo "  (Open the Play repo or workspace in Cursor; Agent will discover play-spring-* skills.)"
+if [[ -z "$SKIP_CURSOR_SETUP" ]]; then
+  echo "Cursor Agent skills: $PLAY_REPO/.cursor/skills/"
+  echo "  (Open the Play repo or workspace in Cursor; Agent will discover play-spring-* skills.)"
+fi
 if [[ -d "$KIT_ROOT/lib" ]] && [[ -n "$(find "$KIT_ROOT/lib" -maxdepth 1 -name '*.jar' 2>/dev/null)" ]]; then
   echo "dev-toolkit JAR copied to: $PLAY_REPO/dev-toolkit-1.0.0.jar"
   echo "  (From Play repo: java -jar dev-toolkit-1.0.0.jar migrate-app)"
 fi
 echo ""
-echo "Next steps:"
-echo "  1. Headless: export CURSOR_API_KEY; run migration_orchestrator.py --play-repo $PLAY_REPO"
-echo "     (creates migration-status.json if needed, runs cursor-agent for Spring init, then migrate-app loop)."
-echo "  2. IDE: Open $WORKSPACE_DIR (or $PLAY_REPO) → Agent → skill play-spring-orchestrator (see docs/play_to_spring_migration.md §2.1)."
-echo "  3. Manual CLI: cd $PLAY_REPO && java -jar dev-toolkit-1.0.0.jar migrate-app"
-echo "  4. Spring build: cd $SPRING_REPO && mvn compile"
+if [[ -z "$SKIP_CURSOR_SETUP" ]]; then
+  echo "Next steps:"
+  echo "  1. Headless: export CURSOR_API_KEY; run scripts/legacy/migration_orchestrator.py --play-repo $PLAY_REPO"
+  echo "     (creates migration-status.json if needed, runs cursor-agent for Spring init, then migrate-app loop)."
+  echo "  2. IDE: Open $WORKSPACE_DIR (or $PLAY_REPO) → Agent → skill play-spring-orchestrator (see docs/legacy/play_to_spring_migration.md §2.1)."
+  echo "  3. Manual CLI: cd $PLAY_REPO && java -jar dev-toolkit-1.0.0.jar migrate-app"
+  echo "  4. Spring build: cd $SPRING_REPO && mvn compile"
+fi
 echo ""

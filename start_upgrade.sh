@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Entry point for Play → Spring automated upgrade (full monorepo clone).
-# Delegates to play-to-spring-kit/scripts/migration_orchestrator.py — same CLI flags.
+# Delegates to play-to-spring-kit/scripts/legacy/migration_orchestrator.py — same CLI flags.
+#
+# --engine langgraph|legacy (default: langgraph as of M5):
+#   langgraph -> python -m agent (play-to-spring-kit/agent/), OpenRouter-backed,
+#                requires OPENROUTER_API_KEY instead of CURSOR_API_KEY. See
+#                docs/langgraph-engine.md for the full node/state model.
+#   legacy    -> scripts/legacy/migration_orchestrator.py (cursor-agent, hardcoded phase order),
+#                kept working for the transition; pass --engine legacy or set
+#                MIGRATION_ENGINE=legacy to opt back into it.
+# --engine is stripped before forwarding argv to the chosen engine.
 #
 # Creates play-to-spring-kit/.venv on first run and installs scripts/requirements-venv.txt
 # (orchestrator stays stdlib; optional deps e.g. pyhocon for --export-play-conf).
+# For --engine langgraph, also installs scripts/requirements-agent.txt into the same venv.
 # Skip venv pip: MIGRATION_SKIP_VENV_SYNC=1
 #
 # Java: prefers JDK 17+ for Spring Boot 3 / Maven (if JAVA_HOME is unset or is Java 8,
@@ -30,11 +40,48 @@
 
 set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env into the shell env so the OPENROUTER_API_KEY/CURSOR_API_KEY checks below
+# (and JAVA_HOME etc.) see vars set only in .env, not just already-exported ones.
+# agent/config.py's load_dotenv() also loads .env for the Python process itself;
+# this is just so this script's own pre-flight warnings aren't false positives.
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/.env"
+  set +a
+fi
 KIT_ROOT="${REPO_ROOT}/play-to-spring-kit"
-ORCHESTRATOR="${KIT_ROOT}/scripts/migration_orchestrator.py"
+ORCHESTRATOR="${KIT_ROOT}/scripts/legacy/migration_orchestrator.py"
 REQ_VENV="${KIT_ROOT}/scripts/requirements-venv.txt"
+REQ_AGENT="${KIT_ROOT}/scripts/requirements-agent.txt"
 VENV_DIR="${KIT_ROOT}/.venv"
 VENV_PY="${VENV_DIR}/bin/python3"
+
+# --- Engine selection: --engine langgraph|legacy (or MIGRATION_ENGINE), stripped from argv ---
+ENGINE="${MIGRATION_ENGINE:-langgraph}"
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --engine)
+      ENGINE="$2"
+      shift 2
+      ;;
+    --engine=*)
+      ENGINE="${1#--engine=}"
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${ARGS[@]}"
+if [[ "$ENGINE" != "legacy" ]] && [[ "$ENGINE" != "langgraph" ]]; then
+  echo "ERROR: --engine must be 'legacy' or 'langgraph' (got '$ENGINE')" >&2
+  exit 1
+fi
 
 # --- Java 17+ (avoid jenv global 1.8 breaking Spring / Maven) ---
 if [[ -n "${JAVA_HOME:-}" ]] && [[ -x "${JAVA_HOME}/bin/java" ]]; then
@@ -59,13 +106,22 @@ if [[ -z "${JAVA_HOME:-}" ]]; then
   fi
 fi
 
-if [[ -z "${CURSOR_API_KEY:-}" ]]; then
-  echo "[start_upgrade] warn: CURSOR_API_KEY unset — headless Spring init (cursor-agent) exits 3 until set or IDE init completes." >&2
-fi
-
-if [[ ! -f "$ORCHESTRATOR" ]]; then
-  echo "ERROR: orchestrator not found at ${ORCHESTRATOR}" >&2
-  exit 1
+if [[ "$ENGINE" == "langgraph" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "[start_upgrade] warn: OPENROUTER_API_KEY unset — LLM rounds (bootstrap/compile-fix) disabled, deterministic fixers still run." >&2
+  fi
+  if [[ ! -d "${KIT_ROOT}/agent" ]]; then
+    echo "ERROR: langgraph engine not found at ${KIT_ROOT}/agent" >&2
+    exit 1
+  fi
+else
+  if [[ -z "${CURSOR_API_KEY:-}" ]]; then
+    echo "[start_upgrade] warn: CURSOR_API_KEY unset — headless Spring init (cursor-agent) exits 3 until set or IDE init completes." >&2
+  fi
+  if [[ ! -f "$ORCHESTRATOR" ]]; then
+    echo "ERROR: orchestrator not found at ${ORCHESTRATOR}" >&2
+    exit 1
+  fi
 fi
 
 # Optional: inject --workspace when MIGRATION_WORKSPACE is set and argv has no --workspace
@@ -91,9 +147,19 @@ if [[ ! -x "$VENV_PY" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-if [[ "${MIGRATION_SKIP_VENV_SYNC:-}" != "1" ]] && [[ -f "$REQ_VENV" ]]; then
+if [[ "${MIGRATION_SKIP_VENV_SYNC:-}" != "1" ]]; then
   "$VENV_PY" -m pip install -q --upgrade pip
-  "$VENV_PY" -m pip install -q -r "$REQ_VENV"
+  if [[ -f "$REQ_VENV" ]]; then
+    "$VENV_PY" -m pip install -q -r "$REQ_VENV"
+  fi
+  if [[ "$ENGINE" == "langgraph" ]] && [[ -f "$REQ_AGENT" ]]; then
+    "$VENV_PY" -m pip install -q -r "$REQ_AGENT"
+  fi
+fi
+
+if [[ "$ENGINE" == "langgraph" ]]; then
+  cd "$KIT_ROOT"
+  exec "$VENV_PY" -m agent "${EXTRA[@]}" "$@"
 fi
 
 exec "$VENV_PY" "$ORCHESTRATOR" "${EXTRA[@]}" "$@"

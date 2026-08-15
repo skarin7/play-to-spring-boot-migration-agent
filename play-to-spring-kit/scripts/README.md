@@ -12,7 +12,7 @@ Python **stdlib-only** driver for the Play → Spring pipeline: `dev-toolkit` **
 
 With **`--skip-build-toolkit`**, you must already have a **`*.jar`** in **`play-to-spring-kit/lib/`** (for example after a manual **`mvn package`**). Use that flag on **re-runs** when you have **not** changed **`java-dev-toolkit`**—the default is to **`mvn package`** every orchestrator invocation so a single command always stays self-contained.
 
-**Where to run from:** use the kit directory as your shell cwd, e.g. **`cd …/play-to-spring-kit`**, then **`python3 scripts/migration_orchestrator.py --play-repo ../your-play-app`**. The kit root (bootstrap script, **`lib/`**) is found via the script file path (**`__file__`**), not cwd. Relative **`--play-repo`** / **`--workspace`** values are resolved against **cwd**, so paths like **`../cms-content-service`** are correct when you launch from the kit directory.
+**Where to run from:** use the kit directory as your shell cwd, e.g. **`cd …/play-to-spring-kit`**, then **`python3 scripts/legacy/migration_orchestrator.py --play-repo ../your-play-app`**. The kit root (bootstrap script, **`lib/`**) is found via the script file path (**`__file__`**), not cwd. Relative **`--play-repo`** / **`--workspace`** values are resolved against **cwd**, so paths like **`../cms-content-service`** are correct when you launch from the kit directory.
 
 **Recommended from the monorepo root:** **`./start_upgrade.sh --play-repo …`** — uses **`play-to-spring-kit/.venv`** and **`scripts/requirements-venv.txt`** so optional deps (e.g. **`pyhocon`**) install without touching system Python. **`MIGRATION_SKIP_VENV_SYNC=1`** skips **`pip install`** on each run.
 
@@ -91,7 +91,7 @@ All orchestrator logs go to **stderr** with timestamps (`HH:MM:SS LEVEL [migrati
 Use **`-v`** / **`--verbose`** or **`MIGRATION_VERBOSE=1`** for **DEBUG** (includes redacted argv dump).
 
 ```bash
-MIGRATION_VERBOSE=1 python3 scripts/migration_orchestrator.py --play-repo ../my-play-app
+MIGRATION_VERBOSE=1 python3 scripts/legacy/migration_orchestrator.py --play-repo ../my-play-app
 ```
 
 ## Environment variables
@@ -139,20 +139,20 @@ Minimal (**only `--play-repo`**; workspace prep runs automatically). From inside
 
 ```bash
 cd /path/to/play-to-spring-kit
-python3 scripts/migration_orchestrator.py --play-repo ../cms-content-service
+python3 scripts/legacy/migration_orchestrator.py --play-repo ../cms-content-service
 ```
 
 Or with an absolute play path from any cwd:
 
 ```bash
-python3 /path/to/play-to-spring-kit/scripts/migration_orchestrator.py \
+python3 /path/to/play-to-spring-kit/scripts/legacy/migration_orchestrator.py \
   --play-repo /path/to/cms-content-service
 ```
 
 Custom workspace / Spring folder name:
 
 ```bash
-python3 scripts/migration_orchestrator.py \
+python3 scripts/legacy/migration_orchestrator.py \
   --play-repo /path/to/play-project \
   --workspace /path/to/workspace-dir \
   --spring-name my-spring-app
@@ -161,7 +161,7 @@ python3 scripts/migration_orchestrator.py \
 Explicit overrides:
 
 ```bash
-python3 scripts/migration_orchestrator.py \
+python3 scripts/legacy/migration_orchestrator.py \
   --play-repo /path/to/play-project \
   --spring-repo /path/to/spring-project \
   --status-file /path/to/spring-project/migration-status.json
@@ -215,7 +215,7 @@ Re-run the same command. Slices in **`migration_units`** (or layers in legacy mo
 ## Overnight run
 
 ```bash
-nohup python3 /path/to/play-to-spring-kit/scripts/migration_orchestrator.py \
+nohup python3 /path/to/play-to-spring-kit/scripts/legacy/migration_orchestrator.py \
   --play-repo "$PLAY_REPO" \
   > orchestrator.log 2>&1 &
 echo $! >> orchestrator.log

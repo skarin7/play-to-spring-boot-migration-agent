@@ -1,0 +1,9 @@
+# LangGraph engine dependencies (installed only for --engine langgraph)
+-r requirements-venv.txt
+langgraph>=0.2,<2
+langgraph-checkpoint-sqlite>=1.0
+langchain-core>=0.3
+langchain-openai>=0.2
+pydantic>=2.7
+tenacity>=8.2
+python-dotenv>=1.0

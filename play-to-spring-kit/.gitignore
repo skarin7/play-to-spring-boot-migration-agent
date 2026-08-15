@@ -2,3 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+# dev-toolkit jar: fetched via toolkit-release.json (tools/fetch_jar.py),
+# never vendored in git.
+lib/*.jar
