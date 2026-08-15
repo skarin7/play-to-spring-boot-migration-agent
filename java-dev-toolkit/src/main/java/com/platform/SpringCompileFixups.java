@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;

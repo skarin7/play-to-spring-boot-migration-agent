@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import java.nio.file.Path;
 import java.util.HashSet;

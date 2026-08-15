@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;

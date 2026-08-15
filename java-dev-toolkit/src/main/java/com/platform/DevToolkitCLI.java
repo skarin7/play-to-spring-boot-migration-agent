@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;

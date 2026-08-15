@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import org.junit.Rule;
 import org.junit.Test;

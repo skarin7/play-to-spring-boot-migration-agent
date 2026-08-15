@@ -1,4 +1,4 @@
-package com.phenom.devtoolkit;
+package com.platform;
 
 import java.io.FileInputStream;
 import java.io.FileWriter;
